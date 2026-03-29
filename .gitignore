@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+core/__pycache__/
+ui/__pycache__/
+
+# Logs
+logs/
+
+# Debug captures
+debug_captures/
+
+# Script files
+install_alt.ps1
+install_main.ps1
+run_debug.bat
+
+# Other
+if not starterted.txt

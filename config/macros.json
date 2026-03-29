@@ -1,0 +1,166 @@
+[
+  {
+    "name": "Tinktur",
+    "steps": [
+      {
+        "delay_ms": 124,
+        "key": "1"
+      },
+      {
+        "delay_ms": 170,
+        "key": "2"
+      }
+    ],
+    "mode": 2,
+    "delay_ms": 8000,
+    "random_ms": 100,
+    "hotkey": "Mouse4",
+    "humanize": false,
+    "active": false,
+    "id": 1486603721408
+  },
+  {
+    "name": "Q - E",
+    "steps": [
+      {
+        "delay_ms": 180,
+        "key": "Q"
+      },
+      {
+        "delay_ms": 176,
+        "key": "E"
+      }
+    ],
+    "mode": 2,
+    "delay_ms": 600,
+    "random_ms": 25,
+    "hotkey": "Mouse5",
+    "humanize": false,
+    "active": false,
+    "id": 2596101268864
+  },
+  {
+    "name": "ПКМ",
+    "steps": [
+      {
+        "delay_ms": 231,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 163,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 153,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 146,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 300,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 293,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 136,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 165,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 148,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 131,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 135,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 153,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 147,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 137,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 128,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 138,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 150,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 159,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 156,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 129,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 146,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 134,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 148,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 164,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 154,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 175,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 132,
+        "key": "Mouse2"
+      },
+      {
+        "delay_ms": 141,
+        "key": "Mouse2"
+      }
+    ],
+    "mode": 2,
+    "delay_ms": 10,
+    "random_ms": 3,
+    "hotkey": "F3",
+    "humanize": false,
+    "active": true,
+    "id": 2429693227456
+  }
+]
