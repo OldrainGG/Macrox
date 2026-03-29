@@ -114,6 +114,9 @@ try:
             from core.monitor_engine import get_monitor_engine
             monitor_engine = get_monitor_engine()
             monitor_engine.load_hotkey_from_settings()
+            splash_signals.step.emit("Инициализация pipeline…")
+            from core.action_pipeline import get_pipeline
+            get_pipeline()   # прогреть рабочий поток
 
             splash_signals.step.emit("Прогрев OCR (фон)…")
             try:
@@ -141,6 +144,8 @@ try:
         from core.monitor_engine import get_monitor_engine
         get_engine().stop()
         get_monitor_engine().stop()
+            from core.action_pipeline import get_pipeline
+            get_pipeline().stop()
         log.info("Clean shutdown complete")
     except Exception as e:
         log.error(f"Shutdown error: {e}")

@@ -104,12 +104,16 @@ class Journal:
             "max_delay":   max(delays) if delays else 0,
         }
 
-    def on_monitor_trigger(self, zone_id: int, zone_name: str, action: str, cooldown_ms: int):
+    def on_monitor_trigger(self, zone_id: int, zone_name: str, action: str,
+                        cooldown_ms: int, actual_cooldown_ms: int = 0):
         e = JournalEntry(
             ts=time.time(), macro_id=zone_id, macro_name=zone_name,
             event="monitor",
-            detail=f"→ {action}  (cooldown {cooldown_ms}мс)",
-            step_key=action, step_delay=cooldown_ms
+            detail=(
+                f"→ {action}  "
+                f"(cooldown {actual_cooldown_ms or cooldown_ms}мс)"
+            ),
+            step_key=action, step_delay=cooldown_ms,
         )
         self._push(e)
 
