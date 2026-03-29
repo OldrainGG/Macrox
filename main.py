@@ -140,12 +140,12 @@ try:
     exit_code = app.exec()
 
     try:
-        from core.macro_engine   import get_engine
-        from core.monitor_engine import get_monitor_engine
+        from core.macro_engine    import get_engine
+        from core.monitor_engine  import get_monitor_engine
+        from core.action_pipeline import get_pipeline
         get_engine().stop()
         get_monitor_engine().stop()
-            from core.action_pipeline import get_pipeline
-            get_pipeline().stop()
+        get_pipeline().stop()
         log.info("Clean shutdown complete")
     except Exception as e:
         log.error(f"Shutdown error: {e}")
