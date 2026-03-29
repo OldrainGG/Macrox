@@ -160,7 +160,7 @@
     "random_ms": 3,
     "hotkey": "F3",
     "humanize": false,
-    "active": true,
+    "active": false,
     "id": 2429693227456
   }
 ]

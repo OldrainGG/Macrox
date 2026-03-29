@@ -8,6 +8,7 @@ Features:
   - Transition detection: fires only on state CHANGE (match→no_match etc.)
   - Per-zone cooldown to prevent spam
   - Thread-safe Qt signals for UI updates
+  - All action execution routed through ActionPipeline (centralized)
 """
 import time, threading, logging, base64
 from io import BytesIO
@@ -31,10 +32,6 @@ monitor_signals = _MonitorSignals()
 def _similarity(img_a, img_b) -> float:
     """
     Pixel-match similarity: fraction of pixels where each channel diff < tolerance.
-    This maps much more intuitively to visual change:
-      0.90 = 90% of pixels look the same → close match
-      0.50 = half the pixels changed      → very different
-    Tolerance=30/255 per channel (~12%) handles JPEG/rendering noise.
     """
     import numpy as np
     a = np.array(img_a.convert("RGB"), dtype=np.int16)
@@ -45,10 +42,10 @@ def _similarity(img_a, img_b) -> float:
             img_b.resize((img_a.width, img_a.height), Image.LANCZOS).convert("RGB"),
             dtype=np.int16
         )
-    tolerance = 30  # per-channel tolerance (0-255)
-    diff      = np.abs(a - b)                          # shape: H×W×3
-    match     = (diff < tolerance).all(axis=2)         # H×W bool: all 3 channels match
-    return float(match.mean())                         # fraction of matching pixels
+    tolerance = 30
+    diff  = np.abs(a - b)
+    match = (diff < tolerance).all(axis=2)
+    return float(match.mean())
 
 
 def capture_region(rect: list):
@@ -77,12 +74,54 @@ def image_to_b64(img) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+# ── Action pipeline helpers ───────────────────────────────────────────────────
+
+def _build_pipeline_action(zone: dict):
+    """
+    Построить Action из данных зоны для отправки в ActionPipeline.
+    Вызывается только когда should_fire() вернул True.
+    """
+    from core.action_pipeline import Action
+    atype = zone.get("action_type", "key")
+    return Action(
+        priority    = zone.get("priority", 2),
+        action_type = atype,
+        parallel    = zone.get("parallel", False),
+        key         = zone.get("action_key", "") if atype == "key" else "",
+        macro_id    = zone.get("action_macro_id") if atype == "macro" else None,
+        source      = "monitor",
+        name        = zone.get("name", ""),
+        zone_id     = zone.get("id", -1),
+        cooldown_ms = zone.get("_actual_cooldown_ms", zone.get("cooldown_ms", 0)),
+    )
+
+
+def _log_monitor_trigger(zone: dict):
+    """Записать событие срабатывания зоны в журнал."""
+    try:
+        from core.journal import get_journal
+        atype      = zone.get("action_type", "key")
+        action_str = (
+            zone.get("action_key", "")
+            if atype == "key"
+            else f"macro#{zone.get('action_macro_id', '')}"
+        )
+        get_journal().on_monitor_trigger(
+            zone_id            = zone.get("id", -1),
+            zone_name          = zone.get("name", ""),
+            action             = action_str,
+            cooldown_ms        = zone.get("cooldown_ms", 0),
+            actual_cooldown_ms = zone.get("_actual_cooldown_ms", 0),
+        )
+    except Exception as e:
+        log.debug(f"_log_monitor_trigger: {e}")
+
+
 # ── Per-zone state tracker ────────────────────────────────────────────────────
 class ZoneWorker:
     """
     Delegates evaluation to ZoneEvaluator (monitor_match.py).
-    Supports both pixel similarity and template matching zone types,
-    including debug_capture, extend_below_px, grid matching, and OCR.
+    Supports both pixel similarity and template matching zone types.
     """
     def __init__(self, zone: dict):
         self.zone       = zone
@@ -108,7 +147,7 @@ class ZoneWorker:
 
     def tick(self) -> tuple[str, float]:
         if not self._evaluator:
-            # Fallback: plain pixel similarity (no monitor_match available)
+            # Fallback: plain pixel similarity
             ref_b64 = self.zone.get("reference", "")
             if not ref_b64:
                 return "error", 0.0
@@ -132,7 +171,6 @@ class ZoneWorker:
         Returns True when zone should trigger.
         - Default (transition): fires only on no_match→match change.
         - repeat_on_cooldown=True: fires every cooldown while condition holds.
-          Use this for persistent buffs that need repeated casting.
         """
         import random
         raw_cond  = self.zone.get("condition", "match")
@@ -155,7 +193,6 @@ class ZoneWorker:
         if elapsed < cooldown:
             return False
 
-        # Transition mode: only fire on state change
         if not repeat and self._prev == state:
             log.debug(f"Zone '{name}': unchanged, repeat_on_cooldown=False → skip")
             return False
@@ -163,99 +200,19 @@ class ZoneWorker:
         log.info(f"Zone '{name}': FIRE! state={state} repeat={repeat} elapsed={elapsed:.1f}s")
         self._prev      = state
         self._last_fire = time.time()
-        # Store actual cooldown (base ± jitter) for journal display
+        # Запомнить фактический cooldown (с jitter) для журнала
         self.zone["_actual_cooldown_ms"] = int(cooldown * 1000)
         return True
-
-
-# ── Action executor ───────────────────────────────────────────────────────────
-def _fire_action(zone: dict):
-    atype = zone.get("action_type", "key")
-    name  = zone.get("name", "?")
-    # Log to journal
-    try:
-        from core.journal import get_journal
-        get_journal().on_monitor_trigger(
-            zone.get("id", -1), name,
-            zone.get("action_key","") or f"macro#{zone.get('action_macro_id','')}",
-            zone.get("cooldown_ms", 0),
-            actual_cooldown_ms=zone.get("_actual_cooldown_ms", 0),
-        )
-    except Exception as _je:
-        log.debug(f"journal log: {_je}")
-    try:
-        if atype == "key":
-            key = zone.get("action_key", "")
-            if key:
-                import threading as _t
-                from core.macro_engine import _execute_steps
-                stop = _t.Event()
-                _t.Thread(
-                    target=_execute_steps,
-                    args=([{"key": key, "delay_ms": 0}], stop, f"Monitor:{name}"),
-                    daemon=True
-                ).start()
-                log.debug(f"Monitor fired key '{key}' for zone '{name}'")
-
-        elif atype == "macro":
-            mid = zone.get("action_macro_id")
-            if mid is not None:
-                from core.macro_engine import get_engine
-                eng    = get_engine()
-                macro  = eng._macros.get(mid)
-                if macro:
-                    from core.macro_engine import MacroRunner
-                    MacroRunner(macro).start()
-                    log.debug(f"Monitor fired macro {mid} for zone '{name}'")
-    except Exception as e:
-        log.error(f"_fire_action zone '{name}': {e}")
-
-
-# ── Priority queue for concurrent triggers ────────────────────────────────────
-class TriggerQueue:
-    """
-    Queues zone triggers by priority.
-    Priority 1 (critical) → executes immediately, blocks lower priorities.
-    Priority 2 (normal)   → executes if no critical is pending.
-    Priority 3 (background) → only if nothing else pending.
-    Zones with parallel=True bypass the queue entirely.
-    """
-    def __init__(self):
-        self._lock    = threading.Lock()
-        self._pending: list[dict] = []   # sorted by priority
-
-    def add(self, zone: dict, sim: float):
-        if zone.get("parallel", False):
-            _fire_action(zone)
-            return
-        with self._lock:
-            # Avoid duplicates (same zone already queued)
-            zid = zone["id"]
-            if any(z["id"] == zid for z in self._pending):
-                return
-            self._pending.append({**zone, "_sim": sim})
-            self._pending.sort(key=lambda z: z.get("priority", 2))
-
-    def flush(self):
-        """Fire the highest-priority pending action. Call once per tick."""
-        with self._lock:
-            if not self._pending:
-                return
-            # Fire only the top item; remove items of same priority that share
-            # the same action (de-duplicate bursts)
-            top = self._pending.pop(0)
-        _fire_action(top)
 
 
 # ── Capture thread ────────────────────────────────────────────────────────────
 class MonitorThread(threading.Thread):
     def __init__(self, get_zones_fn, fps: int = 10):
         super().__init__(daemon=True, name="MonitorThread")
-        self._get_zones  = get_zones_fn
-        self._interval   = 1.0 / max(1, fps)
-        self._quit       = threading.Event()
-        self._workers:   dict[int, ZoneWorker] = {}
-        self._queue      = TriggerQueue()
+        self._get_zones = get_zones_fn
+        self._interval  = 1.0 / max(1, fps)
+        self._quit      = threading.Event()
+        self._workers:  dict[int, ZoneWorker] = {}
 
     def set_fps(self, fps: int):
         self._interval = 1.0 / max(1, fps)
@@ -265,29 +222,34 @@ class MonitorThread(threading.Thread):
 
     def run(self):
         log.info("MonitorThread started")
+        # Инициализируем pipeline заранее (тёплый старт рабочего потока)
+        from core.action_pipeline import get_pipeline
+        pipeline = get_pipeline()
+
         while not self._quit.is_set():
             t0    = time.time()
             zones = [z for z in self._get_zones() if z.get("active", False)]
             self._sync_workers(zones)
 
             for zone in zones:
-                zid = zone["id"]
+                zid    = zone["id"]
                 worker = self._workers.get(zid)
-                if not worker: continue
+                if not worker:
+                    continue
                 try:
                     state, sim = worker.tick()
                     monitor_signals.zone_state.emit(zid, state)
                     if worker.should_fire(state):
                         log.info(
                             f"Zone '{zone['name']}' "
-                            f"p={zone.get('priority',2)} sim={sim:.3f}")
+                            f"p={zone.get('priority', 2)} sim={sim:.3f}"
+                        )
                         monitor_signals.zone_triggered.emit(zid, zone["name"], sim)
-                        self._queue.add(zone, sim)
+                        _log_monitor_trigger(zone)
+                        pipeline.submit(_build_pipeline_action(zone))
                 except Exception as e:
                     log.error(f"Zone {zid}: {e}")
                     monitor_signals.zone_state.emit(zid, "error")
-
-            self._queue.flush()
 
             elapsed = time.time() - t0
             self._quit.wait(timeout=max(0.0, self._interval - elapsed))
@@ -297,11 +259,14 @@ class MonitorThread(threading.Thread):
     def _sync_workers(self, zones: list[dict]):
         ids = {z["id"] for z in zones}
         for zid in list(self._workers):
-            if zid not in ids: del self._workers[zid]
+            if zid not in ids:
+                del self._workers[zid]
         for z in zones:
             zid = z["id"]
-            if zid in self._workers: self._workers[zid].update(z)
-            else:                    self._workers[zid] = ZoneWorker(z)
+            if zid in self._workers:
+                self._workers[zid].update(z)
+            else:
+                self._workers[zid] = ZoneWorker(z)
 
 
 # ── MonitorEngine singleton ───────────────────────────────────────────────────
@@ -311,13 +276,19 @@ class MonitorEngine:
         self._fps    = 10
 
     def start(self, fps: int = None):
-        if fps: self._fps = fps
+        if fps:
+            self._fps = fps
         if self._thread and self._thread.is_alive():
-            self._thread.set_fps(self._fps); return
+            self._thread.set_fps(self._fps)
+            return
+        # Прогреть pipeline перед запуском мониторинга
+        from core.action_pipeline import get_pipeline
+        get_pipeline()
+
         from core.monitor_store import get_monitor_store
         self._thread = MonitorThread(
             get_zones_fn=get_monitor_store().active_zones,
-            fps=self._fps
+            fps=self._fps,
         )
         self._thread.start()
         monitor_signals.engine_started.emit()
@@ -341,20 +312,19 @@ class MonitorEngine:
 
     def toggle(self):
         """Start or stop monitoring — used by hotkey."""
-        if self.is_running(): self.stop()
-        else: self.start()
+        if self.is_running():
+            self.stop()
+        else:
+            self.start()
 
     def register_hotkey(self, hk: str):
-        """
-        Register a global hotkey that toggles the monitor engine.
-        Hooks into pynput listener via macro_engine's HotkeyListener.
-        """
-        if not hk: return
+        """Register a global hotkey that toggles the monitor engine."""
+        if not hk:
+            return
         try:
             from core.macro_engine import get_engine
             eng = get_engine()
             _TOGGLE_ID = -998
-            # Store toggle macro
             eng._macros[_TOGGLE_ID] = {
                 "id": _TOGGLE_ID, "name": "Monitor Toggle",
                 "hotkey": hk, "mode": 0,
@@ -372,13 +342,16 @@ class MonitorEngine:
         try:
             from core.font_scale import _load_settings
             hk = _load_settings().get("monitor_hotkey", "")
-            if hk: self.register_hotkey(hk)
+            if hk:
+                self.register_hotkey(hk)
         except Exception as e:
             log.error(f"load_hotkey_from_settings: {e}")
 
 
 _engine: MonitorEngine | None = None
+
 def get_monitor_engine() -> MonitorEngine:
     global _engine
-    if _engine is None: _engine = MonitorEngine()
+    if _engine is None:
+        _engine = MonitorEngine()
     return _engine
