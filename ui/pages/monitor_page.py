@@ -247,21 +247,23 @@ class ZoneRow(QFrame):
             f"color:{c['text_primary']};font-size:{FONTS['size_md']};font-weight:600;")
         rect  = self.zone.get("rect",[0,0,0,0])
         _is_tpl = self.zone.get("zone_type","pixel") == "template"
-        if _is_tpl:
-            cond  = "найдена" if self.zone.get("condition","found")=="found" else "не найдена"
-            thr   = int(self.zone.get("match_thresh",0.75)*100)
-        else:
-            cond  = "совп." if self.zone.get("condition")=="match" else "≠ совп."
-            thr   = int(self.zone.get("threshold",0.90)*100)
         atype = self.zone.get("action_type","key")
         act   = (self.zone.get("action_key","—") if atype=="key"
                  else f"macro #{self.zone.get('action_macro_id','—')}")
         par   = " ⚡parallel" if self.zone.get("parallel") else ""
+        human = f" ±{self.zone.get('humanize_ms',0)}мс" if self.zone.get('humanize_ms',0) else ""
         if _is_tpl:
-            sr = self.zone.get("search_rect",[0,0,0,0]) or [0,0,0,0]
-            _detail_str = f"🔍 {sr[2]}×{sr[3]}px  •  ≥{thr}%  •  {cond}  →  {act}{par}"
+            cond     = "найдена" if self.zone.get("condition","found")=="found" else "не найдена"
+            thr      = int(self.zone.get("match_thresh",0.75)*100)
+            sr       = self.zone.get("search_rect",[0,0,0,0]) or [0,0,0,0]
+            grid_s   = " 🔲сетка" if self.zone.get("grid") else ""
+            dbg_s    = " 🐛" if self.zone.get("debug_capture") else ""
+            _detail_str = (f"🔍 {sr[2]}×{sr[3]}px  •  ≥{thr}%  •  {cond}"
+                           f"{grid_s}{dbg_s}  →  {act}{par}{human}")
         else:
-            _detail_str = f"{rect[2]}×{rect[3]}px  •  {cond} ≥{thr}%  →  {act}{par}"
+            cond  = "совп." if self.zone.get("condition")=="match" else "≠ совп."
+            thr   = int(self.zone.get("threshold",0.90)*100)
+            _detail_str = f"{rect[2]}×{rect[3]}px  •  {cond} ≥{thr}%  →  {act}{par}{human}"
         self.detail_lbl = QLabel(_detail_str)
         self.detail_lbl.setStyleSheet(
             f"color:{c['text_muted']};font-size:{FONTS['size_xs']};")
@@ -1908,17 +1910,33 @@ class ExpressionBuilder(QWidget):
 
     def load_expr(self, expr: dict):
         """Load an existing expression into the builder."""
-        # Clear existing rows
-        for r in self._rows:
+        # Clear existing rows first
+        for r in list(self._rows):
             r["widget"].deleteLater()
         self._rows.clear()
 
         if not expr:
             return
 
+        # Single operand case: {"zone_id": N} — no top-level op
+        if "zone_id" in expr:
+            self._add_operand_row(zone_id=expr["zone_id"], negate=False)
+            return
+
+        # Single NOT case: {"op": "NOT", "operands": [{"zone_id": N}]}
+        if expr.get("op") == "NOT":
+            inner = expr.get("operands", [{}])[0]
+            zid   = inner.get("zone_id")
+            if zid is not None:
+                self._add_operand_row(zone_id=zid, negate=True)
+            return
+
+        # AND / OR with multiple operands
         top_op = expr.get("op", "AND").upper()
         self._op = top_op
+        self._op_cb.blockSignals(True)
         self._op_cb.setCurrentIndex(0 if top_op == "AND" else 1)
+        self._op_cb.blockSignals(False)
 
         for operand in expr.get("operands", []):
             if "zone_id" in operand:
@@ -2438,12 +2456,10 @@ class MonitorPage(QWidget):
     def _on_zone_saved(self, zone: dict):
         zid = zone["id"]
         if zid in self._rows:
-            # Fetch fresh data from store to guarantee detail is up to date
-            fresh = get_monitor_store().get_zone(self._cur_scene, zid) or zone
-            self._rows[zid].refresh(fresh)
+            self._rows[zid].refresh(zone)
         else:
             self._add_row(zone)
-        # Also refresh group editor zone list (zone names may have changed)
+        # Refresh group editor zone list (names may have changed)
         if self._cur_scene:
             zones = get_monitor_store().zones_for(self._cur_scene)
             self._group_editor.set_scene(self._cur_scene, zones)
