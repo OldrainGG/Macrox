@@ -135,6 +135,45 @@ class MonitorStore:
         s["zones"] = [idx[zid] for zid in ordered_ids if zid in idx]
         self.save()
 
+    # ── Condition Groups CRUD ─────────────────────────────────────────────
+    def groups_for(self, sid: int) -> list[dict]:
+        s = self.get_scene(sid)
+        return list(s.get("groups", [])) if s else []
+
+    def add_group(self, sid: int, group: dict) -> int:
+        s = self.get_scene(sid)
+        if not s:
+            return -1
+        group = dict(group)
+        group["id"] = self._next_zone_id   # переиспользуем счётчик
+        self._next_zone_id += 1
+        s.setdefault("groups", []).append(group)
+        self.save()
+        return group["id"]
+
+    def update_group(self, sid: int, gid: int, data: dict):
+        s = self.get_scene(sid)
+        if not s:
+            return
+        for i, g in enumerate(s.get("groups", [])):
+            if g["id"] == gid:
+                s["groups"][i] = {**g, **data, "id": gid}
+                self.save()
+                return
+
+    def delete_group(self, sid: int, gid: int):
+        s = self.get_scene(sid)
+        if s:
+            s["groups"] = [g for g in s.get("groups", []) if g["id"] != gid]
+            self.save()
+
+    def active_groups(self) -> list[dict]:
+        """Все группы активной сцены."""
+        s = self.active_scene()
+        if not s:
+            return []
+        return [g for g in s.get("groups", []) if g.get("active", False)]
+
     # ── Flat fallback (for engine that just needs active zones) ────────────
     def all(self) -> list[dict]:
         """Backward-compat: returns active scene's zones."""

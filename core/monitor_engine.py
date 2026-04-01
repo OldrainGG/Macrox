@@ -9,6 +9,7 @@ Features:
   - Per-zone cooldown to prevent spam
   - Thread-safe Qt signals for UI updates
   - All action execution routed through ActionPipeline (centralized)
+  - AND/OR/NOT logic via ConditionGroups (condition_engine.py)
 """
 import time, threading, logging, base64
 from io import BytesIO
@@ -78,8 +79,8 @@ def image_to_b64(img) -> str:
 
 def _build_pipeline_action(zone: dict):
     """
-    Построить Action из данных зоны для отправки в ActionPipeline.
-    Вызывается только когда should_fire() вернул True.
+    Построить Action из данных зоны/группы для отправки в ActionPipeline.
+    Вызывается только когда should_fire() / group.tick() вернул True.
     """
     from core.action_pipeline import Action
     atype = zone.get("action_type", "key")
@@ -97,7 +98,7 @@ def _build_pipeline_action(zone: dict):
 
 
 def _log_monitor_trigger(zone: dict):
-    """Записать событие срабатывания зоны в журнал."""
+    """Записать событие срабатывания зоны или группы в журнал."""
     try:
         from core.journal import get_journal
         atype      = zone.get("action_type", "key")
@@ -122,12 +123,14 @@ class ZoneWorker:
     """
     Delegates evaluation to ZoneEvaluator (monitor_match.py).
     Supports both pixel similarity and template matching zone types.
+    Tracks _last_state for use by ConditionGroups.
     """
     def __init__(self, zone: dict):
-        self.zone       = zone
-        self._prev      = None
-        self._last_fire = 0.0
-        self._evaluator = None
+        self.zone        = zone
+        self._prev       = None
+        self._last_fire  = 0.0
+        self._last_state = "no_match"   # читается GroupManager
+        self._evaluator  = None
         self._load_evaluator()
 
     def _load_evaluator(self):
@@ -150,20 +153,28 @@ class ZoneWorker:
             # Fallback: plain pixel similarity
             ref_b64 = self.zone.get("reference", "")
             if not ref_b64:
+                self._last_state = "error"
                 return "error", 0.0
             ref = b64_to_image(ref_b64)
             if ref is None:
+                self._last_state = "error"
                 return "error", 0.0
             cur = capture_region(self.zone.get("rect", [0, 0, 64, 64]))
             if cur is None:
+                self._last_state = "error"
                 return "error", 0.0
             sim   = _similarity(ref, cur)
             state = "match" if sim >= self.zone.get("threshold", 0.90) else "no_match"
+            self._last_state = state
             return state, sim
+
         try:
-            return self._evaluator.evaluate(capture_region)
+            state, sim = self._evaluator.evaluate(capture_region)
+            self._last_state = state
+            return state, sim
         except Exception as e:
             log.error(f"ZoneWorker.tick: {e}")
+            self._last_state = "error"
             return "error", 0.0
 
     def should_fire(self, state: str) -> bool:
@@ -200,7 +211,6 @@ class ZoneWorker:
         log.info(f"Zone '{name}': FIRE! state={state} repeat={repeat} elapsed={elapsed:.1f}s")
         self._prev      = state
         self._last_fire = time.time()
-        # Запомнить фактический cooldown (с jitter) для журнала
         self.zone["_actual_cooldown_ms"] = int(cooldown * 1000)
         return True
 
@@ -209,10 +219,14 @@ class ZoneWorker:
 class MonitorThread(threading.Thread):
     def __init__(self, get_zones_fn, fps: int = 10):
         super().__init__(daemon=True, name="MonitorThread")
-        self._get_zones = get_zones_fn
-        self._interval  = 1.0 / max(1, fps)
-        self._quit      = threading.Event()
-        self._workers:  dict[int, ZoneWorker] = {}
+        self._get_zones    = get_zones_fn
+        self._interval     = 1.0 / max(1, fps)
+        self._quit         = threading.Event()
+        self._workers:     dict[int, ZoneWorker] = {}
+
+        # Condition groups (AND/OR/NOT logic)
+        from core.condition_engine import GroupManager
+        self._group_manager = GroupManager()
 
     def set_fps(self, fps: int):
         self._interval = 1.0 / max(1, fps)
@@ -224,6 +238,7 @@ class MonitorThread(threading.Thread):
         log.info("MonitorThread started")
         # Инициализируем pipeline заранее (тёплый старт рабочего потока)
         from core.action_pipeline import get_pipeline
+        from core.monitor_store   import get_monitor_store
         pipeline = get_pipeline()
 
         while not self._quit.is_set():
@@ -231,6 +246,11 @@ class MonitorThread(threading.Thread):
             zones = [z for z in self._get_zones() if z.get("active", False)]
             self._sync_workers(zones)
 
+            # Синхронизировать группы текущей сцены
+            groups = get_monitor_store().active_groups()
+            self._group_manager.sync(groups)
+
+            # ── Тик каждой зоны ──────────────────────────────────────────
             for zone in zones:
                 zid    = zone["id"]
                 worker = self._workers.get(zid)
@@ -250,6 +270,19 @@ class MonitorThread(threading.Thread):
                 except Exception as e:
                     log.error(f"Zone {zid}: {e}")
                     monitor_signals.zone_state.emit(zid, "error")
+
+            # ── Condition groups (AND/OR/NOT) ─────────────────────────────
+            # Собрать актуальные состояния всех зон из workers
+            zone_states: dict[int, str] = {
+                zid: w._last_state for zid, w in self._workers.items()
+            }
+
+            fired_groups = self._group_manager.evaluate_all(zone_states)
+            for grp in fired_groups:
+                log.info(f"ConditionGroup '{grp['name']}': FIRE!")
+                monitor_signals.zone_triggered.emit(grp["id"], grp["name"], 1.0)
+                _log_monitor_trigger(grp)
+                pipeline.submit(_build_pipeline_action(grp))
 
             elapsed = time.time() - t0
             self._quit.wait(timeout=max(0.0, self._interval - elapsed))

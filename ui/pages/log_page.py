@@ -768,9 +768,10 @@ class TabbedLogPage(QWidget):
         self._filter_steps = True
         self._rows_macro: list[QWidget] = []
         self._rows_mon:   list[QWidget] = []
-        self._bar_data:   dict[str, int] = {}
-        self._step_buckets: dict[str, int] = {}
-        self._chart_series: dict[str, object] = {}
+        self._bar_data:      dict[str, int] = {}
+        self._step_buckets:  dict[str, int] = {}
+        self._monitor_buckets: dict[str, int] = {}
+        self._chart_series:  dict[str, object] = {}
 
         root = QVBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
 
