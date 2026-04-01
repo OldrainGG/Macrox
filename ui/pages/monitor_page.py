@@ -1661,11 +1661,576 @@ class ZoneEditor(QWidget):
 
 
 
+# ── Group row (compact, in group list) ───────────────────────────────────────
+class GroupRow(QFrame):
+    """One row representing a ConditionGroup in the group list."""
+    edit_clicked   = pyqtSignal(dict)
+    delete_clicked = pyqtSignal(dict)
+    toggled        = pyqtSignal(dict, bool)
+
+    def __init__(self, group: dict, zone_names: dict[int, str], parent=None):
+        super().__init__(parent)
+        self.group      = group
+        self._zone_names = zone_names
+        self.setObjectName("GroupRow")
+        self.setFixedHeight(48)
+        self._build()
+
+    def _build(self):
+        c = COLORS
+        self.setStyleSheet(
+            f"QFrame#GroupRow{{background:{c['bg_card']};border:1px solid {c['accent_dim']};"
+            f"border-left:3px solid {c['accent']};border-radius:6px;}}"
+            f"QLabel{{background:transparent;border:none;}}")
+        lay = QHBoxLayout(self); lay.setContentsMargins(8, 4, 8, 4); lay.setSpacing(8)
+
+        # Active toggle
+        active = self.group.get("active", False)
+        self.tog = QPushButton("▶" if not active else "⏸")
+        self.tog.setFixedSize(28, 28)
+        self._style_tog(active)
+        self.tog.clicked.connect(self._on_toggle)
+        lay.addWidget(self.tog)
+
+        # Icon + name
+        icon = QLabel("🔗")
+        icon.setStyleSheet(f"font-size:14px;")
+        lay.addWidget(icon)
+
+        info = QVBoxLayout(); info.setSpacing(1)
+        self.name_lbl = QLabel(self.group.get("name", "Группа"))
+        self.name_lbl.setStyleSheet(
+            f"color:{c['text_primary']};font-size:{FONTS['size_sm']};font-weight:600;")
+        self.detail_lbl = QLabel(self._make_detail())
+        self.detail_lbl.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};")
+        info.addWidget(self.name_lbl)
+        info.addWidget(self.detail_lbl)
+        lay.addLayout(info, 1)
+
+        # Action buttons
+        for icon_t, tip, fn, danger in [
+            ("✏", "Редактировать", lambda: self.edit_clicked.emit(self.group), False),
+            ("✕", "Удалить",       lambda: self.delete_clicked.emit(self.group), True),
+        ]:
+            b = QPushButton(icon_t); b.setFixedSize(26, 26)
+            bg = c['danger_dim'] if danger else c['bg_elevated']
+            fg = c['danger']     if danger else c['text_muted']
+            b.setStyleSheet(
+                f"QPushButton{{background:{bg};color:{fg};border:1px solid {fg};"
+                f"border-radius:4px;font-size:10px;font-weight:700;}}"
+                f"QPushButton:hover{{background:{fg};color:white;}}")
+            b.setToolTip(tip); b.clicked.connect(fn); lay.addWidget(b)
+
+    def _make_detail(self) -> str:
+        """Human-readable summary of the expression."""
+        expr = self.group.get("expression", {})
+        expr_str = self._fmt_expr(expr)
+        atype = self.group.get("action_type", "key")
+        act = (self.group.get("action_key", "—") if atype == "key"
+               else f"macro#{self.group.get('action_macro_id', '—')}")
+        cd = self.group.get("cooldown_ms", 0)
+        return f"{expr_str}  →  {act}  cd:{cd}мс"
+
+    def _fmt_expr(self, expr: dict) -> str:
+        if "zone_id" in expr:
+            zid = expr["zone_id"]
+            return self._zone_names.get(zid, f"zone#{zid}")
+        op = expr.get("op", "?").upper()
+        parts = [self._fmt_expr(o) for o in expr.get("operands", [])]
+        if op == "NOT":
+            return f"NOT({parts[0]})" if parts else "NOT(?)"
+        return f" {op} ".join(parts)
+
+    def _on_toggle(self):
+        new = not self.group.get("active", False)
+        self.group["active"] = new
+        self.tog.setText("⏸" if new else "▶")
+        self._style_tog(new)
+        self.toggled.emit(self.group, new)
+
+    def _style_tog(self, active: bool):
+        c = COLORS
+        if active:
+            self.tog.setStyleSheet(
+                f"QPushButton{{background:{c['success_dim']};color:{c['success']};"
+                f"border:1px solid {c['success']};border-radius:5px;font-size:9px;}}"
+                f"QPushButton:hover{{background:{c['success']};color:white;}}")
+        else:
+            self.tog.setStyleSheet(
+                f"QPushButton{{background:{c['bg_elevated']};color:{c['text_muted']};"
+                f"border:1px solid {c['border']};border-radius:5px;font-size:9px;}}"
+                f"QPushButton:hover{{background:{c['bg_hover']};color:{c['text_primary']};}}")
+
+    def refresh(self, group: dict, zone_names: dict[int, str]):
+        self.group = group
+        self._zone_names = zone_names
+        self.name_lbl.setText(group.get("name", "Группа"))
+        self.detail_lbl.setText(self._make_detail())
+        active = group.get("active", False)
+        self.tog.setText("⏸" if active else "▶")
+        self._style_tog(active)
+
+
+# ── Expression builder (nested AND/OR/NOT editor) ─────────────────────────────
+class ExpressionBuilder(QWidget):
+    """
+    Visual builder for a condition expression tree.
+    Supports depth-1 structure: top-level op (AND/OR) with N zone operands,
+    each optionally wrapped in NOT.
+
+    Internal representation:
+      {
+        "op": "AND" | "OR",
+        "operands": [
+          {"zone_id": N} | {"op": "NOT", "operands": [{"zone_id": N}]}
+        ]
+      }
+    """
+    changed = pyqtSignal()
+
+    def __init__(self, zones: list[dict], parent=None):
+        super().__init__(parent)
+        self._zones = zones   # list of zone dicts from store
+        self._op    = "AND"
+        self._rows:  list[dict] = []   # [{"zone_id": N, "negate": bool}]
+        self._build()
+
+    def _build(self):
+        c = COLORS
+        self.setStyleSheet("background:transparent;")
+        self._root = QVBoxLayout(self)
+        self._root.setContentsMargins(0, 0, 0, 0)
+        self._root.setSpacing(6)
+
+        # Top op selector
+        op_row = QHBoxLayout()
+        op_lbl = QLabel("Логика:")
+        op_lbl.setStyleSheet(f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+        op_row.addWidget(op_lbl)
+        self._op_cb = QComboBox()
+        self._op_cb.addItems(["AND (все условия)", "OR (любое условие)"])
+        self._op_cb.setFixedHeight(26)
+        self._op_cb.setStyleSheet(
+            f"QComboBox{{background:{c['bg_elevated']};color:{c['text_primary']};"
+            f"border:1px solid {c['border_bright']};border-radius:4px;"
+            f"padding:2px 6px;font-size:{FONTS['size_xs']};}}"
+            f"QComboBox QAbstractItemView{{background:{c['bg_elevated']};"
+            f"color:{c['text_primary']};border:1px solid {c['accent']};"
+            f"selection-background-color:{c['accent_dim']};}}")
+        self._op_cb.installEventFilter(_no_scroll)
+        self._op_cb.currentIndexChanged.connect(self._on_op_change)
+        op_row.addWidget(self._op_cb)
+        op_row.addStretch()
+        self._root.addLayout(op_row)
+
+        # Operand rows container
+        self._rows_w = QWidget(); self._rows_w.setStyleSheet("background:transparent;")
+        self._rows_l = QVBoxLayout(self._rows_w)
+        self._rows_l.setContentsMargins(0, 0, 0, 0)
+        self._rows_l.setSpacing(4)
+        self._root.addWidget(self._rows_w)
+
+        # Add operand button
+        add_btn = QPushButton("＋  Добавить условие")
+        add_btn.setFixedHeight(26)
+        add_btn.setStyleSheet(
+            f"QPushButton{{background:{c['bg_elevated']};color:{c['accent_bright']};"
+            f"border:1px solid {c['accent']};border-radius:4px;"
+            f"font-size:{FONTS['size_xs']};padding:0 8px;}}"
+            f"QPushButton:hover{{background:{c['accent_dim']};}}")
+        add_btn.clicked.connect(self._add_operand_row)
+        self._root.addWidget(add_btn)
+
+    def _on_op_change(self, idx: int):
+        self._op = "AND" if idx == 0 else "OR"
+        self.changed.emit()
+
+    def _add_operand_row(self, zone_id: int = None, negate: bool = False):
+        c = COLORS
+        row_w = QWidget(); row_w.setStyleSheet("background:transparent;")
+        row_l = QHBoxLayout(row_w); row_l.setContentsMargins(0, 0, 0, 0); row_l.setSpacing(6)
+
+        # NOT toggle
+        not_cb = QCheckBox("NOT")
+        not_cb.setChecked(negate)
+        not_cb.setStyleSheet(
+            f"QCheckBox{{color:{COLORS['amber']};font-size:{FONTS['size_xs']};"
+            f"font-weight:700;spacing:4px;background:transparent;}}"
+            f"QCheckBox::indicator{{width:13px;height:13px;border-radius:3px;"
+            f"border:1px solid {COLORS['border_bright']};background:{c['bg_panel']};}}"
+            f"QCheckBox::indicator:checked{{background:{COLORS['amber']};"
+            f"border-color:{COLORS['amber']};}}")
+        row_l.addWidget(not_cb)
+
+        # Zone selector
+        zone_cb = QComboBox()
+        zone_cb.setFixedHeight(26)
+        zone_cb.setStyleSheet(
+            f"QComboBox{{background:{c['bg_elevated']};color:{c['text_primary']};"
+            f"border:1px solid {c['border_bright']};border-radius:4px;"
+            f"padding:2px 6px;font-size:{FONTS['size_xs']};}}"
+            f"QComboBox QAbstractItemView{{background:{c['bg_elevated']};"
+            f"color:{c['text_primary']};border:1px solid {c['accent']};"
+            f"selection-background-color:{c['accent_dim']};}}")
+        zone_cb.installEventFilter(_no_scroll)
+        for z in self._zones:
+            zone_cb.addItem(z.get("name", f"#{z['id']}"), z["id"])
+        if zone_id is not None:
+            idx = zone_cb.findData(zone_id)
+            if idx >= 0:
+                zone_cb.setCurrentIndex(idx)
+        row_l.addWidget(zone_cb, 1)
+
+        # Remove button
+        rm_btn = QPushButton("✕")
+        rm_btn.setFixedSize(22, 22)
+        rm_btn.setStyleSheet(
+            f"QPushButton{{background:{c['danger_dim']};color:{c['danger']};"
+            f"border:1px solid {c['danger']};border-radius:3px;"
+            f"font-size:9px;font-weight:700;}}"
+            f"QPushButton:hover{{background:{c['danger']};color:white;}}")
+
+        row_data = {"widget": row_w, "zone_cb": zone_cb, "not_cb": not_cb}
+        rm_btn.clicked.connect(lambda: self._remove_row(row_data))
+        row_l.addWidget(rm_btn)
+
+        self._rows.append(row_data)
+        self._rows_l.addWidget(row_w)
+        not_cb.stateChanged.connect(lambda _: self.changed.emit())
+        zone_cb.currentIndexChanged.connect(lambda _: self.changed.emit())
+        self.changed.emit()
+
+    def _remove_row(self, row_data: dict):
+        self._rows = [r for r in self._rows if r is not row_data]
+        row_data["widget"].deleteLater()
+        self.changed.emit()
+
+    def load_expr(self, expr: dict):
+        """Load an existing expression into the builder."""
+        # Clear existing rows
+        for r in self._rows:
+            r["widget"].deleteLater()
+        self._rows.clear()
+
+        if not expr:
+            return
+
+        top_op = expr.get("op", "AND").upper()
+        self._op = top_op
+        self._op_cb.setCurrentIndex(0 if top_op == "AND" else 1)
+
+        for operand in expr.get("operands", []):
+            if "zone_id" in operand:
+                self._add_operand_row(zone_id=operand["zone_id"], negate=False)
+            elif operand.get("op") == "NOT":
+                inner = operand.get("operands", [{}])[0]
+                zid   = inner.get("zone_id")
+                if zid is not None:
+                    self._add_operand_row(zone_id=zid, negate=True)
+
+    def get_expr(self) -> dict:
+        """Build and return the expression dict."""
+        operands = []
+        for r in self._rows:
+            zid    = r["zone_cb"].currentData()
+            negate = r["not_cb"].isChecked()
+            if zid is None:
+                continue
+            node: dict = {"zone_id": zid}
+            if negate:
+                node = {"op": "NOT", "operands": [node]}
+            operands.append(node)
+        if not operands:
+            return {}
+        if len(operands) == 1 and self._op == "AND":
+            return operands[0]   # single condition — no top-level AND needed
+        return {"op": self._op, "operands": operands}
+
+    def update_zones(self, zones: list[dict]):
+        """Refresh zone list in all comboboxes (called when scene changes)."""
+        self._zones = zones
+        for r in self._rows:
+            cb  = r["zone_cb"]
+            cur = cb.currentData()
+            cb.blockSignals(True)
+            cb.clear()
+            for z in zones:
+                cb.addItem(z.get("name", f"#{z['id']}"), z["id"])
+            if cur is not None:
+                idx = cb.findData(cur)
+                if idx >= 0:
+                    cb.setCurrentIndex(idx)
+            cb.blockSignals(False)
+
+
+# ── Group editor panel ────────────────────────────────────────────────────────
+class GroupEditor(QWidget):
+    """
+    Compact editor for creating/editing ConditionGroups.
+    Embedded inside zone_w below the zone list.
+    """
+    group_saved = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene_id  = None
+        self._edit_group = None
+        self._zones: list[dict] = []
+        self._build()
+
+    def set_scene(self, sid: int, zones: list[dict]):
+        self._scene_id = sid
+        self._zones    = zones
+        self._expr_builder.update_zones(zones)
+
+    def _build(self):
+        c = COLORS
+        self.setStyleSheet("background:transparent;")
+        lay = QVBoxLayout(self); lay.setContentsMargins(0, 8, 0, 0); lay.setSpacing(8)
+
+        # Name field
+        name_row = QHBoxLayout()
+        name_lbl = QLabel("Название:")
+        name_lbl.setFixedWidth(80)
+        name_lbl.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+        name_row.addWidget(name_lbl)
+        self._name_e = QLineEdit()
+        self._name_e.setPlaceholderText("Группа условий")
+        self._name_e.setFixedHeight(26)
+        self._name_e.setStyleSheet(
+            f"background:{c['bg_panel']};color:{c['text_primary']};"
+            f"border:1px solid {c['border']};border-radius:4px;"
+            f"padding:0 8px;font-size:{FONTS['size_xs']};")
+        name_row.addWidget(self._name_e)
+        lay.addLayout(name_row)
+
+        # Expression builder
+        expr_lbl = QLabel("Условие:")
+        expr_lbl.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+        lay.addWidget(expr_lbl)
+        self._expr_builder = ExpressionBuilder(zones=[])
+        lay.addWidget(self._expr_builder)
+
+        # Action row
+        act_row = QHBoxLayout(); act_row.setSpacing(6)
+        act_lbl = QLabel("Действие:")
+        act_lbl.setFixedWidth(80)
+        act_lbl.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+        act_row.addWidget(act_lbl)
+
+        self._act_cb = QComboBox()
+        self._act_cb.addItems(["Клавиша", "Макрос"])
+        self._act_cb.setFixedHeight(26)
+        self._act_cb.setFixedWidth(90)
+        self._act_cb.setStyleSheet(
+            f"QComboBox{{background:{c['bg_elevated']};color:{c['text_primary']};"
+            f"border:1px solid {c['border_bright']};border-radius:4px;"
+            f"padding:2px 6px;font-size:{FONTS['size_xs']};}}"
+            f"QComboBox QAbstractItemView{{background:{c['bg_elevated']};"
+            f"color:{c['text_primary']};border:1px solid {c['accent']};"
+            f"selection-background-color:{c['accent_dim']};}}")
+        self._act_cb.installEventFilter(_no_scroll)
+        self._act_cb.currentIndexChanged.connect(self._on_act_type)
+        act_row.addWidget(self._act_cb)
+
+        self._key_e = QLineEdit()
+        self._key_e.setPlaceholderText("Клавиша (напр. F1)")
+        self._key_e.setFixedHeight(26)
+        self._key_e.setFixedWidth(100)
+        self._key_e.setStyleSheet(
+            f"background:{c['bg_panel']};color:{c['text_primary']};"
+            f"border:1px solid {c['border']};border-radius:4px;"
+            f"padding:0 6px;font-size:{FONTS['size_xs']};")
+        act_row.addWidget(self._key_e)
+
+        self._mac_cb = QComboBox()
+        self._mac_cb.setFixedHeight(26)
+        self._mac_cb.setFixedWidth(120)
+        self._mac_cb.setStyleSheet(
+            f"QComboBox{{background:{c['bg_elevated']};color:{c['text_primary']};"
+            f"border:1px solid {c['border_bright']};border-radius:4px;"
+            f"padding:2px 6px;font-size:{FONTS['size_xs']};}}"
+            f"QComboBox QAbstractItemView{{background:{c['bg_elevated']};"
+            f"color:{c['text_primary']};border:1px solid {c['accent']};"
+            f"selection-background-color:{c['accent_dim']};}}")
+        self._mac_cb.installEventFilter(_no_scroll)
+        self._mac_cb.hide()
+        act_row.addWidget(self._mac_cb)
+        act_row.addStretch()
+        lay.addLayout(act_row)
+
+        # Cooldown + priority row
+        cfg_row = QHBoxLayout(); cfg_row.setSpacing(12)
+
+        for lbl_txt, attr, val, lo, hi, sfx in [
+            ("Cooldown:", "_cool_sp", 1000, 50, 60000, "  мс"),
+            ("Jitter:",   "_hum_sp",  0,    0, 5000,   "  мс"),
+        ]:
+            lbl = QLabel(lbl_txt)
+            lbl.setStyleSheet(
+                f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+            cfg_row.addWidget(lbl)
+            sp = _SpinRow(val=val, lo=lo, hi=hi, suffix=sfx, w_spin=80)
+            setattr(self, attr, sp)
+            cfg_row.addWidget(sp)
+
+        pri_lbl = QLabel("Приоритет:")
+        pri_lbl.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+        cfg_row.addWidget(pri_lbl)
+        self._pri_cb = QComboBox()
+        for k, v in PRIORITY_LABELS.items():
+            self._pri_cb.addItem(v, k)
+        self._pri_cb.setCurrentIndex(1)
+        self._pri_cb.setFixedHeight(26)
+        self._pri_cb.installEventFilter(_no_scroll)
+        self._pri_cb.setStyleSheet(
+            f"QComboBox{{background:{c['bg_elevated']};color:{c['text_primary']};"
+            f"border:1px solid {c['border_bright']};border-radius:4px;"
+            f"padding:2px 6px;font-size:{FONTS['size_xs']};}}"
+            f"QComboBox QAbstractItemView{{background:{c['bg_elevated']};"
+            f"color:{c['text_primary']};border:1px solid {c['accent']};"
+            f"selection-background-color:{c['accent_dim']};}}")
+        cfg_row.addWidget(self._pri_cb)
+
+        self._parallel_cb = QCheckBox("⚡ Parallel")
+        self._parallel_cb.setStyleSheet(
+            f"QCheckBox{{color:{c['text_secondary']};font-size:{FONTS['size_xs']};"
+            f"spacing:4px;background:transparent;}}"
+            f"QCheckBox::indicator{{width:13px;height:13px;border-radius:3px;"
+            f"border:1px solid {c['border_bright']};background:{c['bg_panel']};}}"
+            f"QCheckBox::indicator:checked{{background:{c['accent']};"
+            f"border-color:{c['accent']};}}")
+        cfg_row.addWidget(self._parallel_cb)
+        cfg_row.addStretch()
+        lay.addLayout(cfg_row)
+
+        # Save / Cancel buttons
+        btn_row = QHBoxLayout()
+        self._save_btn = QPushButton("💾  Сохранить группу")
+        self._save_btn.setFixedHeight(28)
+        self._save_btn.setStyleSheet(
+            f"QPushButton{{background:{c['success_dim']};color:{c['success']};"
+            f"border:1px solid {c['success']};border-radius:5px;"
+            f"font-size:{FONTS['size_xs']};font-weight:600;padding:0 12px;}}"
+            f"QPushButton:hover{{background:{c['success']};color:white;}}")
+        self._save_btn.clicked.connect(self._save)
+        btn_row.addWidget(self._save_btn)
+
+        self._cancel_btn = QPushButton("Отмена")
+        self._cancel_btn.setFixedHeight(28)
+        self._cancel_btn.setStyleSheet(
+            f"QPushButton{{background:{c['bg_elevated']};color:{c['text_muted']};"
+            f"border:1px solid {c['border']};border-radius:5px;"
+            f"font-size:{FONTS['size_xs']};padding:0 10px;}}"
+            f"QPushButton:hover{{background:{c['bg_hover']};color:{c['text_primary']};}}")
+        self._cancel_btn.clicked.connect(self.clear)
+        btn_row.addWidget(self._cancel_btn)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        self._refresh_macros()
+
+    def _on_act_type(self, idx: int):
+        self._key_e.setVisible(idx == 0)
+        self._mac_cb.setVisible(idx == 1)
+
+    def _refresh_macros(self):
+        try:
+            from core.macro_store import get_store
+            self._mac_cb.clear()
+            for m in get_store().all():
+                self._mac_cb.addItem(m.get("name", "?"), m.get("id"))
+        except Exception:
+            pass
+
+    def load(self, group: dict):
+        """Load group into editor for editing."""
+        self._edit_group = group
+        self._name_e.setText(group.get("name", ""))
+        self._expr_builder.load_expr(group.get("expression", {}))
+
+        atype = group.get("action_type", "key")
+        self._act_cb.setCurrentIndex(0 if atype == "key" else 1)
+        self._on_act_type(0 if atype == "key" else 1)
+        self._key_e.setText(group.get("action_key", ""))
+        self._refresh_macros()
+
+        mac_id = group.get("action_macro_id")
+        if mac_id is not None:
+            idx = self._mac_cb.findData(mac_id)
+            if idx >= 0:
+                self._mac_cb.setCurrentIndex(idx)
+
+        self._cool_sp.setValue(group.get("cooldown_ms", 1000))
+        self._hum_sp.setValue(group.get("humanize_ms", 0))
+        pri = group.get("priority", 2)
+        self._pri_cb.setCurrentIndex(pri - 1)
+        self._parallel_cb.setChecked(group.get("parallel", False))
+
+    def clear(self):
+        """Reset editor to blank state."""
+        self._edit_group = None
+        self._name_e.clear()
+        for r in list(self._expr_builder._rows):
+            self._expr_builder._remove_row(r)
+        self._act_cb.setCurrentIndex(0)
+        self._key_e.clear()
+        self._cool_sp.setValue(1000)
+        self._hum_sp.setValue(0)
+        self._pri_cb.setCurrentIndex(1)
+        self._parallel_cb.setChecked(False)
+
+    def _save(self):
+        if not self._scene_id:
+            QMessageBox.warning(self, "Нет сцены", "Выберите сцену."); return
+        name = self._name_e.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Введите название группы."); return
+        expr = self._expr_builder.get_expr()
+        if not expr:
+            QMessageBox.warning(self, "Ошибка",
+                "Добавьте хотя бы одно условие (зону)."); return
+
+        atype = "key" if self._act_cb.currentIndex() == 0 else "macro"
+        data  = {
+            "name":          name,
+            "active":        False,
+            "expression":    expr,
+            "action_type":   atype,
+            "action_key":    self._key_e.text().strip() if atype == "key" else "",
+            "action_macro_id": self._mac_cb.currentData() if atype == "macro" else None,
+            "cooldown_ms":   self._cool_sp.value(),
+            "humanize_ms":   self._hum_sp.value(),
+            "priority":      self._pri_cb.currentData(),
+            "parallel":      self._parallel_cb.isChecked(),
+            "repeat_on_cooldown": False,
+        }
+
+        store = get_monitor_store()
+        if self._edit_group:
+            gid = self._edit_group["id"]
+            store.update_group(self._scene_id, gid, data)
+            data["id"] = gid
+        else:
+            gid = store.add_group(self._scene_id, data)
+            data["id"] = gid
+            self._edit_group = data
+
+        self.group_saved.emit(data)
+        log.info(f"Group '{name}' saved (id={gid})")
+
+
 # ── Main Monitor Page ─────────────────────────────────────────────────────────
 class MonitorPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows: dict[int, ZoneRow] = {}   # zid → ZoneRow
+        self._group_rows: dict[int, GroupRow] = {}   # gid → GroupRow
         self._cur_scene: int | None = None
         self._build()
         self._ensure_default_scene()
@@ -1769,6 +2334,39 @@ class MonitorPage(QWidget):
         self.zone_lay.setContentsMargins(0,0,0,0); self.zone_lay.setSpacing(6)
         self.zone_lay.addStretch()
         scroll.setWidget(self.zone_inner); zl.addWidget(scroll,1)
+
+        # ── Condition Groups section ──────────────────────────────────────────
+        self._group_section = CollapsibleSection(
+            "🔗  ГРУППЫ УСЛОВИЙ  (AND / OR / NOT)", expanded=False, accent=True)
+
+        # Group list
+        self._group_rows:  dict[int, GroupRow] = {}
+        self._group_list_w = QWidget(); self._group_list_w.setStyleSheet("background:transparent;")
+        self._group_list_l = QVBoxLayout(self._group_list_w)
+        self._group_list_l.setContentsMargins(0, 0, 0, 0); self._group_list_l.setSpacing(4)
+        self._group_section.add(self._group_list_w)
+
+        # Add group button
+        add_grp_btn = QPushButton("＋  Новая группа")
+        add_grp_btn.setFixedHeight(28)
+        add_grp_btn.setStyleSheet(
+            f"QPushButton{{background:{c['accent_dim']};color:{c['accent_bright']};"
+            f"border:1px solid {c['accent']};border-radius:5px;"
+            f"font-size:{FONTS['size_xs']};font-weight:600;padding:0 10px;}}"
+            f"QPushButton:hover{{background:{c['accent']};color:white;}}")
+        add_grp_btn.clicked.connect(self._new_group)
+        self._group_section.add(add_grp_btn)
+
+        # Inline GroupEditor (hidden until needed)
+        self._group_editor = GroupEditor()
+        self._group_editor.group_saved.connect(self._on_group_saved)
+        self._group_editor_section = CollapsibleSection(
+            "✏  Редактор группы", expanded=False)
+        self._group_editor_section.add(self._group_editor)
+        self._group_section.add(self._group_editor_section)
+
+        zl.addWidget(self._group_section)
+
         ml.addWidget(zone_w,1)
 
         # Editor panel (right)
@@ -1783,9 +2381,9 @@ class MonitorPage(QWidget):
         if not store.scenes():
             store.add_scene("Сцена 1")
 
-    def _load_scene(self, sid: int):
+    def _load_scene(self, sid: int, force: bool = False):
         if sid is None: return
-        if sid == self._cur_scene: return   # already showing this scene (bug 1 fix)
+        if sid == self._cur_scene and not force: return
         self._cur_scene = sid
         self.editor.set_scene(sid)
 
@@ -1803,11 +2401,15 @@ class MonitorPage(QWidget):
         for zone in sorted(zones, key=lambda z: z.get("priority",2)):
             self._add_row(zone)
         self._update_count()
+        self._load_groups(sid)
 
     def _on_scene_deleted(self, sid: int):
         new_active = get_monitor_store().active_scene_id()
-        if new_active: self._load_scene(new_active)
-        else: self._cur_scene = None; self._clear_rows()
+        if new_active:
+            self._cur_scene = None   # force reload
+            self._load_scene(new_active)
+        else:
+            self._cur_scene = None; self._clear_rows()
 
     def _add_row(self, zone: dict):
         row = ZoneRow(zone)
@@ -1836,9 +2438,17 @@ class MonitorPage(QWidget):
     def _on_zone_saved(self, zone: dict):
         zid = zone["id"]
         if zid in self._rows:
-            self._rows[zid].refresh(zone)
+            # Fetch fresh data from store to guarantee detail is up to date
+            fresh = get_monitor_store().get_zone(self._cur_scene, zid) or zone
+            self._rows[zid].refresh(fresh)
         else:
             self._add_row(zone)
+        # Also refresh group editor zone list (zone names may have changed)
+        if self._cur_scene:
+            zones = get_monitor_store().zones_for(self._cur_scene)
+            self._group_editor.set_scene(self._cur_scene, zones)
+            for row in self._group_rows.values():
+                row._zone_names = self._zone_names_map()
 
     def _del_zone(self, zone: dict):
         zid = zone.get("id")
@@ -1870,6 +2480,69 @@ class MonitorPage(QWidget):
             item = self.zone_lay.takeAt(0)
             if item and item.widget(): item.widget().deleteLater()
         self._rows.clear()
+
+    # ── Group methods ─────────────────────────────────────────────────────────
+
+    def _zone_names_map(self) -> dict[int, str]:
+        if not self._cur_scene:
+            return {}
+        return {z["id"]: z.get("name", f"#{z['id']}")
+                for z in get_monitor_store().zones_for(self._cur_scene)}
+
+    def _load_groups(self, sid: int):
+        """Reload group rows for given scene."""
+        # Clear existing
+        for row in list(self._group_rows.values()):
+            self._group_list_l.removeWidget(row); row.deleteLater()
+        self._group_rows.clear()
+        self._group_editor.clear()
+
+        zones = get_monitor_store().zones_for(sid)
+        self._group_editor.set_scene(sid, zones)
+
+        for grp in get_monitor_store().groups_for(sid):
+            self._add_group_row(grp)
+
+    def _add_group_row(self, group: dict):
+        row = GroupRow(group, self._zone_names_map())
+        row.edit_clicked.connect(self._edit_group)
+        row.delete_clicked.connect(self._del_group)
+        row.toggled.connect(self._on_group_toggled)
+        self._group_list_l.addWidget(row)
+        self._group_rows[group["id"]] = row
+
+    def _new_group(self):
+        if not self._cur_scene:
+            QMessageBox.warning(self, "Нет сцены", "Выберите сцену."); return
+        self._group_editor.clear()
+        self._group_editor_section.set_expanded(True)
+
+    def _edit_group(self, group: dict):
+        self._group_editor.load(group)
+        self._group_editor_section.set_expanded(True)
+
+    def _on_group_saved(self, group: dict):
+        gid = group["id"]
+        if gid in self._group_rows:
+            self._group_rows[gid].refresh(group, self._zone_names_map())
+        else:
+            self._add_group_row(group)
+        self._group_editor_section.set_expanded(False)
+
+    def _del_group(self, group: dict):
+        gid = group.get("id")
+        if not gid: return
+        r = QMessageBox.question(self, "Удалить группу?",
+            f"Удалить группу «{group.get('name', '?')}»?")
+        if r != QMessageBox.StandardButton.Yes: return
+        get_monitor_store().delete_group(self._cur_scene, gid)
+        row = self._group_rows.pop(gid, None)
+        if row: self._group_list_l.removeWidget(row); row.deleteLater()
+
+    def _on_group_toggled(self, group: dict, active: bool):
+        if self._cur_scene:
+            get_monitor_store().update_group(
+                self._cur_scene, group["id"], {"active": active})
 
     def _connect_signals(self):
         monitor_signals.zone_state.connect(self._on_zone_state)

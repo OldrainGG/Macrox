@@ -39,8 +39,9 @@ class MonitorStore:
                 self._active_scene = raw.get("active_scene_id")
                 all_sids = [s["id"] for s in self._scenes]
                 all_zids = [z["id"] for s in self._scenes for z in s.get("zones", [])]
+                all_gids = [g["id"] for s in self._scenes for g in s.get("groups", [])]
                 self._next_scene_id = max(all_sids, default=0) + 1
-                self._next_zone_id  = max(all_zids, default=0) + 1
+                self._next_zone_id  = max(all_zids + all_gids, default=0) + 1
         except Exception as e:
             log.error(f"MonitorStore.load: {e}")
 
