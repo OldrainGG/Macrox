@@ -8,7 +8,7 @@ import sys, logging, time, threading
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QWidget, QFrame, QSpinBox, QComboBox,
-    QLayout, QSizePolicy, QApplication
+    QLayout, QSizePolicy, QApplication, QCheckBox, QMessageBox
 )
 from PyQt6.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QRect, QPoint, QSize,
@@ -68,11 +68,29 @@ class FlowLayout(QLayout):
 
 # ── Data model ────────────────────────────────────────────────────────────────
 class MacroStep:
-    def __init__(self, key: str, delay_ms: int):
-        self.key = key; self.delay_ms = max(0, delay_ms)
-    def to_dict(self):      return {"key": self.key, "delay_ms": self.delay_ms}
+    def __init__(self, key: str, delay_ms: int,
+                 condition: dict | None = None,
+                 condition_action: str = "skip"):
+        self.key              = key
+        self.delay_ms         = max(0, delay_ms)
+        self.condition        = condition         # {"zone_id": N, "state": "match"|"no_match"}
+        self.condition_action = condition_action  # "skip" | "stop"
+
+    def to_dict(self) -> dict:
+        d: dict = {"key": self.key, "delay_ms": self.delay_ms}
+        if self.condition:
+            d["condition"]        = self.condition
+            d["condition_action"] = self.condition_action
+        return d
+
     @staticmethod
-    def from_dict(d):       return MacroStep(d["key"], d.get("delay_ms", 0))
+    def from_dict(d: dict) -> "MacroStep":
+        return MacroStep(
+            key              = d["key"],
+            delay_ms         = d.get("delay_ms", 0),
+            condition        = d.get("condition"),
+            condition_action = d.get("condition_action", "skip"),
+        )
 
 
 # ── Step chip ─────────────────────────────────────────────────────────────────
@@ -163,12 +181,47 @@ class StepChip(QWidget):
         db.clicked.connect(lambda: self.deleted.emit(self))
         lay.addWidget(db)
 
+        # 🔒 condition button — amber when condition set, muted otherwise
+        self._cond_btn = QPushButton("🔒")
+        self._cond_btn.setFixedSize(22, 22)
+        self._cond_btn.setToolTip("Условие выполнения шага")
+        self._cond_btn.clicked.connect(self._open_cond_editor)
+        lay.addWidget(self._cond_btn)
+        self._update_cond_btn()
+
     @staticmethod
     def _update_spin_width(sp: QSpinBox, val: int):
         digits = len(str(val))
         # 1-2 digits → 44px, 3 → 52, 4 → 60, 5 → 68
         w = 44 + max(0, digits - 2) * 8
         sp.setFixedWidth(w)
+
+    def _update_cond_btn(self):
+        """Style condition button: amber if condition set, muted if not."""
+        c = COLORS
+        if self.step.condition:
+            self._cond_btn.setStyleSheet(
+                f"QPushButton{{background:{c['amber_dim']};color:{c['amber']};"
+                f"border:1px solid {c['amber']};font-size:10px;"
+                f"border-radius:4px;padding:0;}}"
+                f"QPushButton:hover{{background:{c['amber']};color:white;}}")
+            self._cond_btn.setToolTip(
+                f"Условие: zone#{self.step.condition.get('zone_id')} "
+                f"{self.step.condition.get('state','match')} "
+                f"→ {self.step.condition_action}")
+        else:
+            self._cond_btn.setStyleSheet(
+                f"QPushButton{{background:{c['bg_elevated']};color:{c['text_muted']};"
+                f"border:1px solid {c['border']};font-size:10px;"
+                f"border-radius:4px;padding:0;}}"
+                f"QPushButton:hover{{background:{c['bg_hover']};color:{c['text_primary']};}}")
+            self._cond_btn.setToolTip("Добавить условие выполнения шага")
+
+    def _open_cond_editor(self):
+        """Open a small popup dialog to set/clear this step's condition."""
+        dlg = StepConditionDialog(self.step, parent=self)
+        if dlg.exec():
+            self._update_cond_btn()
 
     # ── drag support ──────────────────────────────────────────────────────────
     def mousePressEvent(self, e):
@@ -204,6 +257,213 @@ class StepChip(QWidget):
 
         self.drag_started.emit(self)
         drag.exec(Qt.DropAction.MoveAction)
+
+
+# ── Step condition editor dialog ──────────────────────────────────────────────
+class StepConditionDialog(QDialog):
+    """
+    Small popup for setting/clearing a step-level condition (Variant B).
+    Edits step.condition and step.condition_action in-place on accept.
+    """
+    def __init__(self, step: MacroStep, parent=None):
+        super().__init__(parent)
+        self._step = step
+        self.setWindowTitle("Условие шага")
+        self.setWindowFlags(
+            Qt.WindowType.Dialog |
+            Qt.WindowType.WindowTitleHint |
+            Qt.WindowType.WindowCloseButtonHint)
+        self.setModal(True)
+        self.setFixedWidth(400)
+        self._build()
+        self._load()
+
+    def _build(self):
+        c = COLORS
+        self.setStyleSheet(
+            f"QDialog{{background:{c['bg_panel']};}}"
+            f"QLabel{{background:transparent;border:none;}}")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(10)
+
+        title = QLabel(f"Условие для шага: {self._step.key}")
+        title.setStyleSheet(
+            f"color:{c['text_primary']};font-size:{FONTS['size_md']};font-weight:700;")
+        lay.addWidget(title)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"background:{c['border']};max-height:1px;border:none;")
+        lay.addWidget(sep)
+
+        # Enable checkbox
+        self._enabled_cb = QCheckBox("Включить условие для этого шага")
+        self._enabled_cb.setStyleSheet(
+            f"QCheckBox{{color:{c['text_secondary']};font-size:{FONTS['size_sm']};"
+            f"spacing:6px;}}"
+            f"QCheckBox::indicator{{width:14px;height:14px;border-radius:3px;"
+            f"border:1px solid {c['border_bright']};background:{c['bg_panel']};}}"
+            f"QCheckBox::indicator:checked{{background:{c['accent']};"
+            f"border-color:{c['accent']};}}")
+        self._enabled_cb.stateChanged.connect(self._on_toggle)
+        lay.addWidget(self._enabled_cb)
+
+        # Detail widget
+        self._detail_w = QWidget()
+        self._detail_w.setStyleSheet("background:transparent;")
+        dl = QVBoxLayout(self._detail_w)
+        dl.setContentsMargins(16, 0, 0, 0); dl.setSpacing(8)
+
+        # Zone row
+        zr = QHBoxLayout()
+        zl = QLabel("Зона мониторинга:")
+        zl.setFixedWidth(130)
+        zl.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+        zr.addWidget(zl)
+        self._zone_cb = QComboBox()
+        self._zone_cb.setFixedHeight(26)
+        self._zone_cb.setStyleSheet(self._cb_s())
+        self._populate_zones()
+        zr.addWidget(self._zone_cb, 1)
+        dl.addLayout(zr)
+
+        # State row
+        sr = QHBoxLayout()
+        sl = QLabel("Состояние зоны:")
+        sl.setFixedWidth(130)
+        sl.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+        sr.addWidget(sl)
+        self._state_cb = QComboBox()
+        self._state_cb.addItem("совпадает (match)",       "match")
+        self._state_cb.addItem("не совпадает (no_match)", "no_match")
+        self._state_cb.setFixedHeight(26)
+        self._state_cb.setStyleSheet(self._cb_s())
+        sr.addWidget(self._state_cb, 1)
+        dl.addLayout(sr)
+
+        # Action row
+        ar = QHBoxLayout()
+        al_lbl = QLabel("Если условие не выполнено:")
+        al_lbl.setFixedWidth(130)
+        al_lbl.setWordWrap(True)
+        al_lbl.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+        ar.addWidget(al_lbl)
+        self._action_cb = QComboBox()
+        self._action_cb.addItem("Пропустить шаг (skip)", "skip")
+        self._action_cb.addItem("Остановить макрос (stop)", "stop")
+        self._action_cb.setFixedHeight(26)
+        self._action_cb.setStyleSheet(self._cb_s())
+        ar.addWidget(self._action_cb, 1)
+        dl.addLayout(ar)
+
+        # Hint
+        hint = QLabel(
+            "Шаг выполнится только если зона в указанном состоянии.\n"
+            "Мониторинг должен быть запущен.")
+        hint.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-style:italic;")
+        dl.addWidget(hint)
+
+        lay.addWidget(self._detail_w)
+
+        # Buttons
+        br = QHBoxLayout(); br.setSpacing(8)
+        self._clear_btn = QPushButton("🗑 Убрать условие")
+        self._clear_btn.setFixedHeight(30)
+        self._clear_btn.setStyleSheet(
+            f"QPushButton{{background:{c['danger_dim']};color:{c['danger']};"
+            f"border:1px solid {c['danger']};border-radius:5px;"
+            f"font-size:{FONTS['size_xs']};padding:0 10px;}}"
+            f"QPushButton:hover{{background:{c['danger']};color:white;}}")
+        self._clear_btn.clicked.connect(self._clear)
+        br.addWidget(self._clear_btn)
+        br.addStretch()
+
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setFixedHeight(30)
+        cancel_btn.setStyleSheet(
+            f"QPushButton{{background:{c['bg_elevated']};color:{c['text_muted']};"
+            f"border:1px solid {c['border']};border-radius:5px;"
+            f"font-size:{FONTS['size_xs']};padding:0 10px;}}"
+            f"QPushButton:hover{{background:{c['bg_hover']};color:{c['text_primary']};}}")
+        cancel_btn.clicked.connect(self.reject)
+        br.addWidget(cancel_btn)
+
+        ok_btn = QPushButton("✓ Применить")
+        ok_btn.setFixedHeight(30)
+        ok_btn.setStyleSheet(
+            f"QPushButton{{background:{c['success_dim']};color:{c['success']};"
+            f"border:1px solid {c['success']};border-radius:5px;"
+            f"font-size:{FONTS['size_xs']};font-weight:600;padding:0 10px;}}"
+            f"QPushButton:hover{{background:{c['success']};color:white;}}")
+        ok_btn.clicked.connect(self._apply)
+        br.addWidget(ok_btn)
+        lay.addLayout(br)
+
+    def _on_toggle(self, state):
+        self._detail_w.setVisible(bool(state))
+        self.adjustSize()
+
+    def _populate_zones(self):
+        self._zone_cb.clear()
+        self._zone_cb.addItem("— не выбрана —", None)
+        try:
+            from core.monitor_store import get_monitor_store
+            store = get_monitor_store()
+            sid   = store.active_scene_id()
+            for z in (store.zones_for(sid) if sid else []):
+                self._zone_cb.addItem(
+                    f"{z.get('name','?')}  (#{z['id']})", z["id"])
+        except Exception:
+            pass
+
+    def _load(self):
+        cond = self._step.condition
+        if cond and cond.get("zone_id") is not None:
+            self._enabled_cb.setChecked(True)
+            idx = self._zone_cb.findData(cond["zone_id"])
+            if idx >= 0: self._zone_cb.setCurrentIndex(idx)
+            si = self._state_cb.findData(cond.get("state", "match"))
+            if si >= 0: self._state_cb.setCurrentIndex(si)
+            ai = self._action_cb.findData(
+                self._step.condition_action or "skip")
+            if ai >= 0: self._action_cb.setCurrentIndex(ai)
+        else:
+            self._enabled_cb.setChecked(False)
+            self._detail_w.hide()
+
+    def _apply(self):
+        if self._enabled_cb.isChecked():
+            zone_id = self._zone_cb.currentData()
+            if zone_id is None:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Нет зоны", "Выберите зону мониторинга.")
+                return
+            self._step.condition        = {
+                "zone_id": zone_id,
+                "state":   self._state_cb.currentData(),
+            }
+            self._step.condition_action = self._action_cb.currentData()
+        else:
+            self._step.condition        = None
+            self._step.condition_action = "skip"
+        self.accept()
+
+    def _clear(self):
+        self._step.condition        = None
+        self._step.condition_action = "skip"
+        self.accept()
+
+    def _cb_s(self) -> str:
+        c = COLORS
+        return (f"QComboBox{{background:{c['bg_elevated']};color:{c['text_primary']};"
+                f"border:1px solid {c['border_bright']};border-radius:4px;"
+                f"padding:2px 6px;font-size:{FONTS['size_xs']};}}"
+                f"QComboBox QAbstractItemView{{background:{c['bg_elevated']};"
+                f"color:{c['text_primary']};border:1px solid {c['accent']};"
+                f"selection-background-color:{c['accent_dim']};}}")
 
 
 # ── "+" separator label ───────────────────────────────────────────────────────

@@ -14,68 +14,184 @@ Modes:
 Hotkey format (same as HotkeyCapture uses):
   Keyboard:  "A", "F1", "CTRL+SHIFT+A", "SPACE", "ESCAPE"
   Mouse:     "Mouse1"-"Mouse5"
+
+Condition system (Этап 3):
+  Macro-level (Variant A):
+    macro["condition"] = {
+        "zone_id": N,        # zone to check
+        "state":   "match"   # "match" | "no_match"
+    }
+    If condition is not met when hotkey fires — macro is skipped entirely.
+
+  Step-level (Variant B):
+    step["condition"] = {
+        "zone_id": N,
+        "state":   "match"
+    }
+    step["condition_action"] = "skip" | "stop"
+    If condition is not met — step is skipped (or macro is stopped).
+
+  Both can be combined freely.
 """
 
-import time, logging, threading
+import time, logging, threading, random
 from PyQt6.QtCore import QObject, pyqtSignal
 from core.logger import trace_calls
 from core.macro_store import get_store
 
-# ── Engine-level Qt signals (emitted from engine, consumed by UI) ─────────────
-class _EngineSignals(QObject):
-    macro_started = pyqtSignal(str)          # macro name
-    macro_stopped = pyqtSignal(str)          # macro name
-    active_count_changed = pyqtSignal(int)   # number of currently running macros
-    step_executed = pyqtSignal(str, str, int) # macro_name, key, delay_ms
+log = logging.getLogger(__name__)
 
-engine_signals = _EngineSignals()
+
+# ── Engine-level Qt signals ───────────────────────────────────────────────────
+class _EngineSignals(QObject):
+    macro_started        = pyqtSignal(str)           # macro name
+    macro_stopped        = pyqtSignal(str)           # macro name
+    active_count_changed = pyqtSignal(int)           # number of currently running macros
+    step_executed        = pyqtSignal(str, str, int) # macro_name, key, delay_ms
+    step_skipped         = pyqtSignal(str, str)      # macro_name, key (condition not met)
+
+# Lazily created after QApplication exists — avoids thread-affinity issues
+_engine_signals_instance: "_EngineSignals | None" = None
+
+def _get_signals() -> "_EngineSignals":
+    global _engine_signals_instance
+    if _engine_signals_instance is None:
+        _engine_signals_instance = _EngineSignals()
+    return _engine_signals_instance
+
+# Public alias — safe to import, actual object created on first use
+class _SignalsProxy:
+    """Proxy that forwards attribute access to the lazily-created signals object."""
+    def __getattr__(self, name):
+        return getattr(_get_signals(), name)
+
+engine_signals = _SignalsProxy()
+
+
+def _journal_call(fn, *args):
+    """
+    Schedule a Journal call on the main thread via QTimer.singleShot(0).
+    This is the most reliable way to cross thread boundaries in PyQt6 —
+    no QObject affinity issues, no connection type guessing.
+    """
+    from PyQt6.QtCore import QTimer
+    QTimer.singleShot(0, lambda: _safe_journal(fn, *args))
+
+def _safe_journal(fn, *args):
+    try:
+        fn(*args)
+    except Exception as e:
+        log.debug(f"_safe_journal: {e}")
+
+
+def _journal_started(macro_id: int, macro_name: str):
+    try:
+        from core.journal import get_journal
+        get_journal().on_macro_started(macro_id, macro_name)
+    except Exception as e:
+        log.debug(f"_journal_started: {e}")
+
+def _journal_stopped(macro_id: int, macro_name: str):
+    try:
+        from core.journal import get_journal
+        get_journal().on_macro_stopped(macro_id, macro_name)
+    except Exception as e:
+        log.debug(f"_journal_stopped: {e}")
+
+def _journal_step(macro_id: int, macro_name: str, key: str, delay_ms: int):
+    try:
+        from core.journal import get_journal
+        get_journal().on_step_executed(macro_id, macro_name, key, delay_ms)
+    except Exception as e:
+        log.debug(f"_journal_step: {e}")
 
 
 def _connect_journal():
-    """Wire engine signals into the Journal. Called once at engine start."""
-    from core.journal import get_journal
-    j = get_journal()
-    engine_signals.macro_started.connect(
-        lambda name: j.on_macro_started(_get_id_by_name(name), name)
-    )
-    engine_signals.macro_stopped.connect(
-        lambda name: j.on_macro_stopped(_get_id_by_name(name), name)
-    )
-    engine_signals.step_executed.connect(
-        lambda name, key, delay: j.on_step_executed(_get_id_by_name(name), name, key, delay)
-    )
+    """
+    Wire engine signals into the Journal.
+    NOTE: Journal is now called directly via QTimer.singleShot from MacroRunner
+    (see _journal_call). This function connects active_count_changed for UI only.
+    Kept for backward compatibility and future use.
+    """
+    pass  # Direct calls via _journal_call handle all journal writes
+
 
 def _get_id_by_name(name: str) -> int:
-    """Reverse-lookup macro id from name (best-effort)."""
+    """Reverse-lookup macro id from name (best-effort, uses first match)."""
     try:
-        from core.macro_engine import get_engine
         eng = get_engine()
         for mid, m in eng._macros.items():
-            if m.get('name') == name:
+            if m.get("name") == name:
                 return mid
     except Exception:
         pass
     return -1
 
-log = logging.getLogger(__name__)
+
+# ── Zone state checker (for conditions) ──────────────────────────────────────
+
+def _check_zone_condition(condition: dict | None) -> bool:
+    """
+    Evaluate a condition dict against the current MonitorEngine zone state.
+    Returns True if condition passes (or if no condition is set).
+
+    condition = {"zone_id": N, "state": "match" | "no_match"}
+    """
+    if not condition:
+        return True
+    zone_id  = condition.get("zone_id")
+    expected = condition.get("state", "match")
+    if zone_id is None:
+        return True
+    try:
+        from core.monitor_engine import get_monitor_engine
+        engine = get_monitor_engine()
+        thread = engine._thread
+        if thread is None:
+            log.debug(f"Condition check: monitor not running → pass through")
+            return True
+        worker = thread._workers.get(zone_id)
+        if worker is None:
+            log.debug(f"Condition check: zone_id={zone_id} not found in workers → pass through")
+            return True
+        actual = worker._last_state
+        result = (actual == expected)
+        log.debug(f"Condition check: zone_id={zone_id} expected={expected} actual={actual} → {result}")
+        return result
+    except Exception as e:
+        log.warning(f"_check_zone_condition: {e} → pass through")
+        return True
 
 
 # ── Step executor ─────────────────────────────────────────────────────────────
-def _execute_steps(steps: list[dict], stop_event: threading.Event, macro_name: str = ""):
-    """Send keystrokes/clicks for one pass through steps. Stops if stop_event set."""
+def _execute_steps(steps: list[dict], stop_event: threading.Event,
+                   macro_name: str = "", kb=None, ms=None,
+                   macro_id: int = -1) -> bool:
+    """
+    Send keystrokes/clicks for one pass through steps.
+    Stops if stop_event is set.
+
+    Accepts optional pre-created kb/ms controllers to avoid
+    re-creating them on every call in Hold/Toggle loops.
+
+    Returns False if macro-stop was requested via step condition.
+    """
     try:
         from pynput.keyboard import Controller as KbCtrl, KeyCode, Key
         from pynput.mouse   import Controller as MsCtrl, Button
         from ui._pynput_compat import build_mouse_map
     except ImportError:
         log.error("pynput not available — cannot execute macro")
-        return
+        return True
 
-    kb = KbCtrl()
-    ms = MsCtrl()
-    MOUSE_MAP_INV = {v: k for k, v in build_mouse_map().items()}   # "Mouse1" → Button.left
+    # Reuse controllers if provided (Hold/Toggle perf fix)
+    if kb is None:
+        kb = KbCtrl()
+    if ms is None:
+        ms = MsCtrl()
 
-    # Modifier name → pynput Key
+    MOUSE_MAP_INV = {v: k for k, v in build_mouse_map().items()}
+
     MOD_KEYS = {
         "CTRL":  Key.ctrl,
         "SHIFT": Key.shift,
@@ -85,26 +201,46 @@ def _execute_steps(steps: list[dict], stop_event: threading.Event, macro_name: s
 
     for step in steps:
         if stop_event.is_set():
-            return
+            return True
+
+        # ── Step-level condition (Variant B) ──────────────────────────────
+        step_cond = step.get("condition")
+        if step_cond:
+            if not _check_zone_condition(step_cond):
+                cond_action = step.get("condition_action", "skip")
+                key_str     = step.get("key", "")
+                log.info(f"Step condition not met: key='{key_str}' action={cond_action}")
+                try:
+                    engine_signals.step_skipped.emit(macro_name, key_str)
+                except Exception:
+                    pass
+                if cond_action == "stop":
+                    return False   # signal caller to stop the macro
+                continue           # skip this step
 
         delay_ms = step.get("delay_ms", 0)
         if delay_ms > 0:
-            # Sleep in small chunks so stop_event is respected quickly
             slept = 0
             while slept < delay_ms and not stop_event.is_set():
                 chunk = min(20, delay_ms - slept)
                 time.sleep(chunk / 1000.0)
                 slept += chunk
             if stop_event.is_set():
-                return
+                return True
 
         key_str = step.get("key", "")
         _press_key(kb, ms, key_str, MOD_KEYS, MOUSE_MAP_INV)
-        # Emit step event to journal
+        # Direct journal call via main-thread timer — reliable across threads
+        _mid  = macro_id if macro_id >= 0 else _get_id_by_name(macro_name)
+        _dms  = step.get("delay_ms", 0)
+        _journal_call(_journal_step, _mid, macro_name, key_str, _dms)
+        # Keep signal for any external subscribers
         try:
-            engine_signals.step_executed.emit(macro_name, key_str, step.get("delay_ms", 0))
+            engine_signals.step_executed.emit(macro_name, key_str, _dms)
         except Exception:
             pass
+
+    return True
 
 
 # ── Windows SendInput — works with DirectInput/Raw Input games ───────────────
@@ -124,7 +260,6 @@ _WIN_VK = {
 }
 
 def _vk_for(name: str) -> int | None:
-    """Get virtual key code — layout-independent via VkKeyScanW."""
     upper = name.upper()
     if upper in _WIN_VK:
         return _WIN_VK[upper]
@@ -132,18 +267,13 @@ def _vk_for(name: str) -> int | None:
         try:
             import ctypes
             res = ctypes.windll.user32.VkKeyScanW(ord(name.upper()))
-            vk = res & 0xFF
+            vk  = res & 0xFF
             return vk if vk != 0xFF else None
         except Exception:
             pass
     return None
 
 def _send_input_key(key_str: str) -> bool:
-    """
-    Send key press via Windows SendInput with KEYEVENTF_SCANCODE.
-    Layout-independent — works with DirectInput/Raw Input games.
-    Returns True on success.
-    """
     try:
         import ctypes, ctypes.wintypes as _wt
 
@@ -156,33 +286,30 @@ def _send_input_key(key_str: str) -> bool:
         class _INPUT(ctypes.Structure):
             _fields_ = [("type",_wt.DWORD),("u",_IU)]
 
-        KEYUP  = 0x0002
-        SCAN   = 0x0008
-        KBD    = 1
+        KEYUP = 0x0002
+        SCAN  = 0x0008
+        KBD   = 1
 
         def _send(vk: int, up: bool):
-            scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
+            scan  = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
             flags = SCAN | (KEYUP if up else 0)
-            inp = _INPUT(type=KBD, u=_IU(ki=_KEYBDINPUT(
+            inp   = _INPUT(type=KBD, u=_IU(ki=_KEYBDINPUT(
                 wVk=0, wScan=scan, dwFlags=flags, time=0,
                 dwExtraInfo=ctypes.pointer(ctypes.c_ulong(0)))))
             ctypes.windll.user32.SendInput(
                 1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
 
-        parts = key_str.split("+")
-        mods  = [p.upper() for p in parts[:-1] if p.upper() in _WIN_VK]
-        base  = parts[-1]
-
+        parts   = key_str.split("+")
+        mods    = [p.upper() for p in parts[:-1] if p.upper() in _WIN_VK]
+        base    = parts[-1]
         vk_base = _vk_for(base)
         if vk_base is None:
             return False
 
-        for m in mods:
-            _send(_WIN_VK[m], False)
+        for m in mods:          _send(_WIN_VK[m], False)
         _send(vk_base, False)
         _send(vk_base, True)
-        for m in reversed(mods):
-            _send(_WIN_VK[m], True)
+        for m in reversed(mods): _send(_WIN_VK[m], True)
 
         log.debug(f"Exec key (SendInput/scan): {key_str}")
         return True
@@ -192,33 +319,21 @@ def _send_input_key(key_str: str) -> bool:
 
 
 def _press_key(kb, ms, key_str: str, MOD_KEYS: dict, MOUSE_MAP_INV: dict):
-    """Parse key_str and send the appropriate press+release.
-    Tries Windows SendInput (scancode, layout-independent) first,
-    falls back to pynput for non-Windows or unmappable keys."""
     from pynput.keyboard import KeyCode, Key
-
     if not key_str:
         return
-
-    # Mouse buttons — pynput only
     if key_str in MOUSE_MAP_INV:
         btn = MOUSE_MAP_INV[key_str]
         ms.click(btn)
         log.debug(f"Exec mouse: {key_str}")
         return
-
-    # Try SendInput first (games, DirectInput)
     if _send_input_key(key_str):
         return
-
-    # Fallback: pynput (WM_KEYDOWN — works in most apps, not raw-input games)
     parts = key_str.split("+")
     mods  = [MOD_KEYS[p] for p in parts[:-1] if p in MOD_KEYS]
     base  = parts[-1]
-
     for m in mods:
         kb.press(m)
-
     pkey = _resolve_key(base)
     if pkey is not None:
         try:
@@ -226,69 +341,42 @@ def _press_key(kb, ms, key_str: str, MOD_KEYS: dict, MOUSE_MAP_INV: dict):
             kb.release(pkey)
         except Exception as e:
             log.warning(f"pynput key press failed for '{base}': {e}")
-
     for m in reversed(mods):
         kb.release(m)
-
     log.debug(f"Exec key (pynput): {key_str}")
 
 
 def _resolve_key(name: str):
-    """Convert string name to pynput key object."""
     from pynput.keyboard import KeyCode, Key
-
-    # Single printable character
     if len(name) == 1:
         return KeyCode.from_char(name.lower())
-
-    # Special keys by name
     SPECIAL = {
-        "SPACE":     Key.space,
-        "ENTER":     Key.enter,
-        "RETURN":    Key.enter,
-        "TAB":       Key.tab,
-        "ESCAPE":    Key.esc,
-        "ESC":       Key.esc,
-        "BACKSPACE": Key.backspace,
-        "DELETE":    Key.delete,
-        "DEL":       Key.delete,
-        "INSERT":    Key.insert,
-        "HOME":      Key.home,
-        "END":       Key.end,
-        "PAGE_UP":   Key.page_up,
-        "PAGE_DOWN": Key.page_down,
-        "UP":        Key.up,
-        "DOWN":      Key.down,
-        "LEFT":      Key.left,
-        "RIGHT":     Key.right,
-        "CAPS_LOCK": Key.caps_lock,
-        "NUM_LOCK":  Key.num_lock,
+        "SPACE":     Key.space,  "ENTER":      Key.enter,
+        "RETURN":    Key.enter,  "TAB":        Key.tab,
+        "ESCAPE":    Key.esc,    "ESC":        Key.esc,
+        "BACKSPACE": Key.backspace, "DELETE":  Key.delete,
+        "DEL":       Key.delete, "INSERT":     Key.insert,
+        "HOME":      Key.home,   "END":        Key.end,
+        "PAGE_UP":   Key.page_up,"PAGE_DOWN":  Key.page_down,
+        "UP":        Key.up,     "DOWN":       Key.down,
+        "LEFT":      Key.left,   "RIGHT":      Key.right,
+        "CAPS_LOCK": Key.caps_lock, "NUM_LOCK":Key.num_lock,
         "PRINT_SCREEN": Key.print_screen,
         "SCROLL_LOCK":  Key.scroll_lock,
-        "PAUSE":     Key.pause,
-        "MENU":      Key.menu,
-        "CTRL":      Key.ctrl,
-        "SHIFT":     Key.shift,
-        "ALT":       Key.alt,
-        "WIN":       Key.cmd,
+        "PAUSE":     Key.pause,  "MENU":       Key.menu,
+        "CTRL":      Key.ctrl,   "SHIFT":      Key.shift,
+        "ALT":       Key.alt,    "WIN":        Key.cmd,
         "CMD":       Key.cmd,
     }
     if name in SPECIAL:
         return SPECIAL[name]
-
-    # F-keys
     if name.startswith("F") and name[1:].isdigit():
-        n = int(name[1:])
-        fkey = getattr(Key, f"f{n}", None)
+        fkey = getattr(Key, f"f{int(name[1:])}", None)
         if fkey: return fkey
-
-    # Numpad
     if name.startswith("NUM_"):
         rest = name[4:]
         if rest.isdigit():
             return KeyCode.from_char(rest)
-
-    # Fallback: try as KeyCode char
     try:
         return KeyCode.from_char(name.lower())
     except Exception:
@@ -300,62 +388,107 @@ def _resolve_key(name: str):
 class MacroRunner(threading.Thread):
     """
     Runs a single macro according to its mode.
-    Controlled via start_event / stop_event from MacroEngine.
+
+    Fix: controllers created once in __init__ — not per-iteration.
+    Fix: _running flag cleared only after thread fully exits.
+    Fix: macro_stopped signal emitted only if macro was actually running.
     """
 
-    def __init__(self, macro: dict):
+    def __init__(self, macro: dict, on_done=None):
         super().__init__(daemon=True, name=f"Runner-{macro.get('name','?')}")
         self.macro      = macro
         self._stop      = threading.Event()
-        self._hold_flag = threading.Event()  # for Hold mode: set while key held
+        self._hold_flag = threading.Event()
         self._running   = False
+        self._on_done   = on_done   # callback(macro_id) called when runner finishes naturally
+        # Pre-create controllers (reused across iterations in Hold/Toggle)
+        self._kb = None
+        self._ms = None
+
+    def _init_controllers(self):
+        """Lazy-init input controllers inside the runner thread."""
+        try:
+            from pynput.keyboard import Controller as KbCtrl
+            from pynput.mouse   import Controller as MsCtrl
+            self._kb = KbCtrl()
+            self._ms = MsCtrl()
+        except Exception as e:
+            log.error(f"Controller init failed: {e}")
 
     def signal_key_down(self):
-        """Called when hotkey is pressed (Hold mode: mark key as held)."""
         self._hold_flag.set()
 
     def signal_key_up(self):
-        """Called when hotkey is released (Hold mode: clear hold)."""
         self._hold_flag.clear()
 
     def stop(self):
         self._stop.set()
         self._hold_flag.clear()
 
-    def is_running(self):
-        return self._running
+    def is_running(self) -> bool:
+        return self._running and self.is_alive()   # Fix: both flags must be true
 
     def run(self):
         self._running = True
+        self._init_controllers()
+
         mode  = self.macro.get("mode", 0)
         steps = self.macro.get("steps", [])
         name  = self.macro.get("name", "?")
+        mid   = self.macro.get("id", -1)
         log.info(f"MacroRunner start: '{name}'  mode={mode}  steps={len(steps)}")
 
+        # Journal: macro started — via QTimer to main thread
+        _journal_call(_journal_started, mid, name)
+
+        skipped_by_condition = False
         try:
-            if mode == 0:    self._run_once(steps)
-            elif mode == 1:  self._run_hold(steps)
-            elif mode == 2:  self._run_toggle(steps)
+            macro_cond = self.macro.get("condition")
+            if macro_cond and not _check_zone_condition(macro_cond):
+                log.info(f"MacroRunner '{name}': macro condition not met → skip")
+                skipped_by_condition = True
+            else:
+                if mode == 0:   self._run_once(steps, name, mid)
+                elif mode == 1: self._run_hold(steps, name, mid)
+                elif mode == 2: self._run_toggle(steps, name, mid)
         except Exception as e:
             log.error(f"MacroRunner '{name}' error: {e}", exc_info=True)
 
         self._running = False
         log.info(f"MacroRunner done: '{name}'")
 
-    def _run_once(self, steps):
-        _execute_steps(steps, self._stop, self.macro.get('name',''))
+        # Journal: macro stopped — direct call for natural completion
+        if not skipped_by_condition:
+            _journal_call(_journal_stopped, mid, name)
 
-    def _run_hold(self, steps):
-        """Loop steps while _hold_flag is set."""
+        # UI signal: active count update
+        if not self._stop.is_set() and not skipped_by_condition:
+            try:
+                engine_signals.macro_stopped.emit(name)
+                engine_signals.active_count_changed.emit(0)
+            except Exception:
+                pass
+
+        # Clean up from engine's _runners map
+        if self._on_done:
+            try:
+                self._on_done(mid)
+            except Exception:
+                pass
+
+    def _run_once(self, steps, name, mid=-1):
+        _execute_steps(steps, self._stop, name, self._kb, self._ms, mid)
+
+    def _run_hold(self, steps, name, mid=-1):
         delay_ms  = self.macro.get("delay_ms", 100)
         random_ms = self.macro.get("random_ms", 0)
         while self._hold_flag.is_set() and not self._stop.is_set():
-            _execute_steps(steps, self._stop, self.macro.get('name',''))
-            if self._stop.is_set():
+            should_continue = _execute_steps(
+                steps, self._stop, name, self._kb, self._ms, mid)
+            if not should_continue or self._stop.is_set():
                 break
-            # Inter-repetition delay with humanization
-            import random
-            total = delay_ms + random.randint(-random_ms, random_ms) if random_ms else delay_ms
+            total = (delay_ms + random.randint(-random_ms, random_ms)
+                     if random_ms else delay_ms)
             total = max(0, total)
             slept = 0
             while slept < total and self._hold_flag.is_set() and not self._stop.is_set():
@@ -363,16 +496,16 @@ class MacroRunner(threading.Thread):
                 time.sleep(chunk / 1000.0)
                 slept += chunk
 
-    def _run_toggle(self, steps):
-        """Loop steps until stop() is called."""
+    def _run_toggle(self, steps, name, mid=-1):
         delay_ms  = self.macro.get("delay_ms", 100)
         random_ms = self.macro.get("random_ms", 0)
         while not self._stop.is_set():
-            _execute_steps(steps, self._stop, self.macro.get('name',''))
-            if self._stop.is_set():
+            should_continue = _execute_steps(
+                steps, self._stop, name, self._kb, self._ms, mid)
+            if not should_continue or self._stop.is_set():
                 break
-            import random
-            total = delay_ms + random.randint(-random_ms, random_ms) if random_ms else delay_ms
+            total = (delay_ms + random.randint(-random_ms, random_ms)
+                     if random_ms else delay_ms)
             total = max(0, total)
             slept = 0
             while slept < total and not self._stop.is_set():
@@ -383,10 +516,6 @@ class MacroRunner(threading.Thread):
 
 # ── Hotkey listener thread ────────────────────────────────────────────────────
 class HotkeyListener(threading.Thread):
-    """
-    Single global pynput listener.
-    Tracks pressed keys/buttons → fires on_press / on_release callbacks.
-    """
     def __init__(self, on_press, on_release):
         super().__init__(daemon=True, name="HotkeyListener")
         self._on_press   = on_press
@@ -402,7 +531,7 @@ class HotkeyListener(threading.Thread):
         try:
             from pynput import keyboard, mouse as pmouse
             from ui._pynput_compat import build_mouse_map
-            MOUSE_MAP = build_mouse_map()          # Button → "Mouse1"..
+            MOUSE_MAP     = build_mouse_map()
             MOUSE_MAP_INV = {v: k for k, v in MOUSE_MAP.items()}
 
             MOD_MAP = {
@@ -422,21 +551,25 @@ class HotkeyListener(threading.Thread):
                 if key in MOD_MAP:
                     return MOD_MAP[key]
                 try:
-                    return key.char.upper() if (hasattr(key,'char') and key.char) else key.name.upper()
+                    return (key.char.upper()
+                            if (hasattr(key, "char") and key.char)
+                            else key.name.upper())
                 except Exception:
                     return str(key).upper().strip("'<>")
 
             def _build_combo(base: str) -> str:
                 mods = sorted(m for k, m in MOD_MAP.items() if k in self._held)
-                seen = set(); unique_mods = []
+                seen: set = set()
+                unique_mods = []
                 for m in mods:
-                    if m not in seen: seen.add(m); unique_mods.append(m)
+                    if m not in seen:
+                        seen.add(m); unique_mods.append(m)
                 return "+".join(unique_mods + [base]) if unique_mods else base
 
             def kb_press(key):
                 if self._quit.is_set(): return False
                 self._held.add(key)
-                if key in MOD_MAP: return   # modifier only — don't fire combo yet
+                if key in MOD_MAP: return
                 combo = _build_combo(_key_to_str(key))
                 self._on_press(combo)
 
@@ -468,22 +601,15 @@ class HotkeyListener(threading.Thread):
 
 # ── MacroEngine singleton ─────────────────────────────────────────────────────
 class MacroEngine:
-    """
-    Central controller. Call start() once at app launch.
-    MacrosPage calls register/unregister when macros are added/changed/deleted.
-    """
-
     def __init__(self):
-        self._lock      = threading.Lock()
-        self._macros:   dict[int, dict]        = {}   # id → macro data
-        self._runners:  dict[int, MacroRunner] = {}   # id → active runner
-        self._listener: HotkeyListener | None  = None
-        # hotkey string → list of macro ids
-        self._hotkey_map: dict[str, list[int]] = {}
+        self._lock       = threading.Lock()
+        self._macros:    dict[int, dict]        = {}
+        self._runners:   dict[int, MacroRunner] = {}
+        self._listener:  HotkeyListener | None  = None
+        self._hotkey_map: dict[str, list[int]]  = {}
 
     @trace_calls
     def start(self):
-        """Start the global hotkey listener."""
         if self._listener and self._listener.is_alive():
             log.warning("MacroEngine already running")
             return
@@ -492,7 +618,6 @@ class MacroEngine:
             on_release = self._on_hotkey_release,
         )
         self._listener.start()
-        # Load all active macros from store
         for m in get_store().all():
             self.register(m)
         _connect_journal()
@@ -500,7 +625,6 @@ class MacroEngine:
 
     @trace_calls
     def stop(self):
-        """Stop everything — call on app exit."""
         self._stop_all_runners()
         if self._listener:
             self._listener.stop()
@@ -509,7 +633,6 @@ class MacroEngine:
 
     @trace_calls
     def register(self, macro: dict):
-        """Add or update a macro in the engine."""
         mid = macro.get("id")
         if mid is None:
             log.warning("register: macro has no id"); return
@@ -521,7 +644,6 @@ class MacroEngine:
 
     @trace_calls
     def unregister(self, macro_id: int):
-        """Remove a macro (stops it if running)."""
         self._stop_runner(macro_id)
         with self._lock:
             self._macros.pop(macro_id, None)
@@ -530,7 +652,6 @@ class MacroEngine:
 
     @trace_calls
     def set_active(self, macro_id: int, active: bool):
-        """Enable or disable a macro without removing it."""
         with self._lock:
             if macro_id in self._macros:
                 self._macros[macro_id]["active"] = active
@@ -538,7 +659,6 @@ class MacroEngine:
                 if not active:
                     self._stop_runner(macro_id)
         log.info(f"Macro id={macro_id} active={active}")
-        # Persist
         get_store().update(macro_id, {"active": active})
 
     def is_running(self, macro_id: int) -> bool:
@@ -555,7 +675,7 @@ class MacroEngine:
                 continue
             mode = macro.get("mode", 0)
             log.debug(f"Hotkey '{combo}' pressed → macro id={mid} mode={mode}")
-            if mode == 0:   self._trigger_once(mid)
+            if   mode == 0: self._trigger_once(mid)
             elif mode == 1: self._trigger_hold_start(mid)
             elif mode == 2: self._trigger_toggle(mid)
 
@@ -598,7 +718,6 @@ class MacroEngine:
         macro = self._macros.get(mid)
         if not macro:
             return None
-        # Special: monitor toggle synthetic macro
         if macro.get("_monitor_toggle"):
             try:
                 from core.monitor_engine import get_monitor_engine
@@ -607,7 +726,16 @@ class MacroEngine:
             except Exception as e:
                 log.error(f"Monitor toggle: {e}")
             return None
-        runner = MacroRunner(macro)
+
+        def _on_runner_done(macro_id: int):
+            """Called from runner thread when macro finishes naturally."""
+            self._runners.pop(macro_id, None)
+            try:
+                engine_signals.active_count_changed.emit(len(self._runners))
+            except Exception:
+                pass
+
+        runner = MacroRunner(macro, on_done=_on_runner_done)
         self._runners[mid] = runner
         runner.start()
         name = macro.get("name", "?")
@@ -618,10 +746,9 @@ class MacroEngine:
 
     def _stop_runner(self, mid: int):
         runner = self._runners.pop(mid, None)
-        if runner:
+        if runner and runner.is_alive():   # Fix: only emit stopped if was alive
             runner.stop()
-            mid_data = self._macros.get(mid, {})
-            name = mid_data.get("name", "?")
+            name = self._macros.get(mid, {}).get("name", "?")
             engine_signals.macro_stopped.emit(name)
             engine_signals.active_count_changed.emit(len(self._runners))
             log.debug(f"Runner stopped for '{name}', total active: {len(self._runners)}")

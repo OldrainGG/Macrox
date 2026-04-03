@@ -48,7 +48,7 @@
           "action_macro_id": null,
           "cooldown_ms": 4300,
           "humanize_ms": 210,
-          "active": true,
+          "active": false,
           "id": 2,
           "extend_below_px": 28,
           "debug_capture": false,
@@ -56,7 +56,7 @@
           "ocr_off_y": 0,
           "ocr_shrink": 0,
           "repeat_on_cooldown": true,
-          "_actual_cooldown_ms": 4404
+          "_actual_cooldown_ms": 4390
         },
         {
           "name": "HP Bar",
@@ -97,13 +97,13 @@
           "humanize_ms": 10,
           "active": true,
           "id": 3,
-          "_actual_cooldown_ms": 95
+          "_actual_cooldown_ms": 101
         }
       ],
       "groups": [
         {
           "name": "Yolo",
-          "active": true,
+          "active": false,
           "expression": {
             "zone_id": 3
           },
@@ -116,7 +116,7 @@
           "parallel": true,
           "repeat_on_cooldown": false,
           "id": 4,
-          "_actual_cooldown_ms": 7981
+          "_actual_cooldown_ms": 8070
         }
       ]
     }

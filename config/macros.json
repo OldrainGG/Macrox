@@ -162,5 +162,35 @@
     "humanize": false,
     "active": false,
     "id": 2429693227456
+  },
+  {
+    "name": "Test",
+    "steps": [
+      {
+        "delay_ms": 1194,
+        "key": "F1"
+      },
+      {
+        "condition": {
+          "state": "no_match",
+          "zone_id": 3
+        },
+        "condition_action": "skip",
+        "delay_ms": 1601,
+        "key": "F2"
+      },
+      {
+        "delay_ms": 877,
+        "key": "F1"
+      }
+    ],
+    "mode": 0,
+    "delay_ms": 1000,
+    "random_ms": 100,
+    "hotkey": "Mouse5",
+    "humanize": true,
+    "active": true,
+    "condition": null,
+    "id": 2596101268865
   }
 ]
