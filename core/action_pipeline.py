@@ -43,13 +43,16 @@ class Action:
     # "key"   → нажать одну клавишу (поле key)
     # "steps" → выполнить список шагов (поле steps)
     # "macro" → запустить макрос через MacroEngine (поле macro_id)
+    # "state" → установить переменную состояния (поля state_var_name, state_var_value)
 
     parallel: bool = field(compare=False, default=False)
 
     # Payload
-    key:      str            = field(compare=False, default="")
-    steps:    list           = field(compare=False, default_factory=list)
-    macro_id: Optional[int]  = field(compare=False, default=None)
+    key:             str           = field(compare=False, default="")
+    steps:           list          = field(compare=False, default_factory=list)
+    macro_id:        Optional[int] = field(compare=False, default=None)
+    state_var_name:  str           = field(compare=False, default="")
+    state_var_value: object        = field(compare=False, default=None)
 
     # Метаданные (для логирования)
     source:      str = field(compare=False, default="unknown")  # "monitor" | "macro" | "blueprint"
@@ -140,6 +143,8 @@ class ActionPipeline:
                 self._exec_steps(action.steps, action.name)
             elif action.action_type == "macro":
                 self._exec_macro(action.macro_id, action.name)
+            elif action.action_type == "state":
+                self._exec_state(action.state_var_name, action.state_var_value, action.name)
             else:
                 log.warning(f"Pipeline: неизвестный action_type='{action.action_type}'")
         except Exception as e:
@@ -185,6 +190,18 @@ class ActionPipeline:
                 log.warning(f"Pipeline: macro id={macro_id} не найден в движке")
         except Exception as e:
             log.error(f"Pipeline._exec_macro {macro_id}: {e}")
+
+    @staticmethod
+    def _exec_state(var_name: str, value, zone_name: str):
+        """Установить переменную состояния через StateStore."""
+        if not var_name:
+            return
+        try:
+            from core.state_store import get_state_store
+            get_state_store().set(var_name, value)
+            log.debug(f"Pipeline: state '{var_name}' = {value!r} (from '{zone_name}')")
+        except Exception as e:
+            log.error(f"Pipeline._exec_state '{var_name}': {e}")
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

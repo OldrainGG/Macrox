@@ -100,3 +100,6 @@ class BlueprintPage(QWidget):
 
 # LogPage is now implemented in ui/pages/log_page.py
 from ui.pages.log_page import TabbedLogPage as LogPage  # re-export (tabbed)
+
+# StatePage is now implemented in ui/pages/state_page.py
+from ui.pages.state_page import StatePage as StatePage  # re-export

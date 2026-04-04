@@ -68,6 +68,36 @@ class Journal:
         )
         self._push(e)
 
+    def on_macro_skipped(self, macro_id: int, macro_name: str):
+        """Весь макрос пропущен из-за условия (Variant A)."""
+        e = JournalEntry(
+            ts=time.time(), macro_id=macro_id, macro_name=macro_name,
+            event="skipped", detail=f"Макрос '{macro_name}' пропущен (условие не выполнено)"
+        )
+        self._push(e)
+
+    def on_step_skipped(self, macro_id: int, macro_name: str, key: str, action: str):
+        """Шаг макроса пропущен или макрос остановлен из-за условия (Variant B)."""
+        detail = (
+            f"Шаг [{key}] остановил макрос (условие не выполнено)"
+            if action == "stop"
+            else f"Шаг [{key}] пропущен (условие не выполнено)"
+        )
+        e = JournalEntry(
+            ts=time.time(), macro_id=macro_id, macro_name=macro_name,
+            event="skipped", detail=detail, step_key=key
+        )
+        self._push(e)
+
+    def on_state_changed(self, var_name: str, old_val, new_val):
+        """Переменная состояния изменилась (от StateStore)."""
+        e = JournalEntry(
+            ts=time.time(), macro_id=-1, macro_name=var_name,
+            event="state",
+            detail=f"{var_name}: {old_val!r} → {new_val!r}",
+        )
+        self._push(e)
+
     def on_error(self, macro_id: int, macro_name: str, msg: str):
         self._runs.pop(macro_id, None)
         e = JournalEntry(
@@ -92,16 +122,37 @@ class Journal:
         runs     = [e for e in self._entries if e.event == "stopped"]
         errors   = [e for e in self._entries if e.event == "error"]
         steps    = [e for e in self._entries if e.event == "step"]
+        monitors = [e for e in self._entries if e.event == "monitor"]
+        skipped  = [e for e in self._entries if e.event == "skipped"]
+        states   = [e for e in self._entries if e.event == "state"]
         total_ms = sum(e.duration_ms for e in runs)
         delays   = [e.step_delay for e in steps if e.step_delay > 0]
+        uptime_ms = int((time.time() - self._session_start) * 1000)
+
+        # per-macro run counts for bar chart
+        macro_runs: dict[str, int] = {}
+        for e in runs:
+            macro_runs[e.macro_name] = macro_runs.get(e.macro_name, 0) + 1
+
+        # per-zone trigger counts for bar chart
+        zone_triggers: dict[str, int] = {}
+        for e in monitors:
+            zone_triggers[e.macro_name] = zone_triggers.get(e.macro_name, 0) + 1
+
         return {
-            "runs":        len(runs),
-            "errors":      len(errors),
-            "steps":       len(steps),
-            "total_ms":    total_ms,
-            "avg_delay":   int(sum(delays) / len(delays)) if delays else 0,
-            "min_delay":   min(delays) if delays else 0,
-            "max_delay":   max(delays) if delays else 0,
+            "runs":          len(runs),
+            "errors":        len(errors),
+            "steps":         len(steps),
+            "monitors":      len(monitors),
+            "skipped":       len(skipped),
+            "total_ms":      total_ms,
+            "uptime_ms":     uptime_ms,
+            "avg_delay":     int(sum(delays) / len(delays)) if delays else 0,
+            "min_delay":     min(delays) if delays else 0,
+            "max_delay":     max(delays) if delays else 0,
+            "macro_runs":    macro_runs,
+            "zone_triggers": zone_triggers,
+            "state_changes": len(states),
         }
 
     def on_monitor_trigger(self, zone_id: int, zone_name: str, action: str,

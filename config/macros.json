@@ -1,6 +1,6 @@
 [
   {
-    "name": "Tinktur",
+    "name": "Tink",
     "steps": [
       {
         "delay_ms": 124,
@@ -17,7 +17,8 @@
     "hotkey": "Mouse4",
     "humanize": false,
     "active": false,
-    "id": 1486603721408
+    "id": 1486603721408,
+    "condition": null
   },
   {
     "name": "Q - E",
@@ -190,7 +191,11 @@
     "hotkey": "Mouse5",
     "humanize": true,
     "active": true,
-    "condition": null,
+    "condition": {
+      "state_var": "hp",
+      "op": "<",
+      "value": 2650
+    },
     "id": 2596101268865
   }
 ]

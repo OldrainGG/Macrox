@@ -8,7 +8,7 @@ from PyQt6.QtCore import QSize, QTimer
 from ui.theme import get_app_stylesheet, COLORS, FONTS
 from ui.sidebar import Sidebar
 from ui.pages.macros_page import MacrosPage
-from ui.pages.placeholder_pages import SettingsPage, MonitorPage, BlueprintPage, LogPage
+from ui.pages.placeholder_pages import SettingsPage, MonitorPage, BlueprintPage, LogPage, StatePage
 from core.logger import trace_calls
 
 log = logging.getLogger(__name__)
@@ -170,8 +170,8 @@ class MainWindow(QMainWindow):
         root.addWidget(self.sidebar)
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("background:transparent;")
-        PAGE_NAMES = ["Макросы","Настройки","Мониторинг","Blueprint","Журнал"]
-        self.pages = [MacrosPage(), SettingsPage(), MonitorPage(), BlueprintPage(), LogPage()]
+        PAGE_NAMES = ["Макросы","Настройки","Мониторинг","Blueprint","State","Журнал"]
+        self.pages = [MacrosPage(), SettingsPage(), MonitorPage(), BlueprintPage(), StatePage(), LogPage()]
         for p in self.pages:
             self.stack.addWidget(p)
         self._page_names = PAGE_NAMES

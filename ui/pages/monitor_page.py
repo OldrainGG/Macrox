@@ -246,13 +246,20 @@ class ZoneRow(QFrame):
         self.name_lbl.setStyleSheet(
             f"color:{c['text_primary']};font-size:{FONTS['size_md']};font-weight:600;")
         rect  = self.zone.get("rect",[0,0,0,0])
-        _is_tpl = self.zone.get("zone_type","pixel") == "template"
+        _ztype  = self.zone.get("zone_type","pixel")
+        _is_tpl = _ztype == "template"
+        _is_ocr = _ztype == "ocr_read"
         atype = self.zone.get("action_type","key")
         act   = (self.zone.get("action_key","—") if atype=="key"
                  else f"macro #{self.zone.get('action_macro_id','—')}")
         par   = " ⚡parallel" if self.zone.get("parallel") else ""
         human = f" ±{self.zone.get('humanize_ms',0)}мс" if self.zone.get('humanize_ms',0) else ""
-        if _is_tpl:
+        if _is_ocr:
+            var   = self.zone.get("state_var_name","?")
+            mode  = self.zone.get("ocr_mode","int")
+            cd    = self.zone.get("cooldown_ms", 500)
+            _detail_str = f"📖 OCR→{var}  ({mode})  {rect[2]}×{rect[3]}px  •  обновл. каждые {cd}мс"
+        elif _is_tpl:
             cond     = "найдена" if self.zone.get("condition","found")=="found" else "не найдена"
             thr      = int(self.zone.get("match_thresh",0.75)*100)
             sr       = self.zone.get("search_rect",[0,0,0,0]) or [0,0,0,0]
@@ -269,6 +276,19 @@ class ZoneRow(QFrame):
             f"color:{c['text_muted']};font-size:{FONTS['size_xs']};")
         info.addWidget(self.name_lbl); info.addWidget(self.detail_lbl)
         lay.addLayout(info, 1)
+
+        # Live OCR value label (only visible for ocr_read zones)
+        self.val_lbl = QLabel("—")
+        self.val_lbl.setFixedWidth(64)
+        self.val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.val_lbl.setStyleSheet(
+            f"color:{c['accent_bright']};font-size:{FONTS['size_xs']};"
+            f"font-family:{FONTS['mono']};background:transparent;border:none;")
+        self.val_lbl.setVisible(_is_ocr)
+        lay.addWidget(self.val_lbl)
+
+        # Thumbnail: hide for OCR zones (no reference image)
+        self.thumb.setVisible(not _is_ocr)
 
         # LED
         self.led = LedDot(); lay.addWidget(self.led)
@@ -343,7 +363,14 @@ class ZoneRow(QFrame):
                   else f"macro #{zone.get('action_macro_id','—')}")
         par    = " ⚡" if zone.get("parallel") else ""
         human  = f" ±{zone.get('humanize_ms',0)}мс" if zone.get('humanize_ms',0) else ""
-        if is_tpl:
+        is_ocr = zone.get("zone_type","pixel") == "ocr_read"
+        if is_ocr:
+            var  = zone.get("state_var_name","?")
+            mode = zone.get("ocr_mode","int")
+            cd   = zone.get("cooldown_ms", 500)
+            self.detail_lbl.setText(
+                f"📖 OCR→{var}  ({mode})  {rect[2]}×{rect[3]}px  •  обновл. каждые {cd}мс")
+        elif is_tpl:
             sr    = zone.get("search_rect",[0,0,0,0]) or [0,0,0,0]
             thr   = int(zone.get("match_thresh", 0.75) * 100)
             cond  = "найдена" if zone.get("condition","found")=="found" else "не найдена"
@@ -421,12 +448,22 @@ class ScenePanel(QWidget):
         b.clicked.connect(lambda _, i=sid: self._select(i))
         rl.addWidget(b, 1)
 
-        del_b = QPushButton("✕"); del_b.setFixedSize(28, 28)
+        ren_b = QPushButton("✎"); ren_b.setFixedSize(24, 28)
+        ren_b.setToolTip("Переименовать сцену")
+        ren_b.setStyleSheet(
+            f"QPushButton{{background:{c['bg_elevated']};color:{c['text_muted']};"
+            f"border:1px solid {c['border']};border-radius:4px;font-size:11px;}}"
+            f"QPushButton:hover{{background:{c['bg_hover']};color:{c['accent_bright']};"
+            f"border-color:{c['accent']};}}")
+        ren_b.clicked.connect(lambda _, i=sid, btn=b: self._rename_scene(i, btn))
+        rl.addWidget(ren_b)
+
+        del_b = QPushButton("✕"); del_b.setFixedSize(24, 28)
         del_b.setToolTip("Удалить сцену")
         del_b.setStyleSheet(
             f"QPushButton{{background:#5C1A1A;color:#FF4444;"
             f"border:2px solid #FF4444;border-radius:5px;"
-            f"font-size:13px;font-weight:900;padding:0;}}"
+            f"font-size:11px;font-weight:900;padding:0;}}"
             f"QPushButton:hover{{background:#FF4444;color:white;"
             f"border-color:#FF6666;}}")
         del_b.clicked.connect(lambda _, i=sid: self._del_scene(i))
@@ -477,6 +514,16 @@ class ScenePanel(QWidget):
             new_sid = scenes[0]["id"]
             self._select(new_sid)
         self.scene_deleted.emit(sid)
+
+    def _rename_scene(self, sid: int, btn: QPushButton):
+        old_name = get_monitor_store().get_scene(sid)
+        old_name = old_name["name"] if old_name else ""
+        name, ok = QInputDialog.getText(
+            self, "Переименовать сцену", "Новое название:", text=old_name)
+        if not ok or not name.strip() or name.strip() == old_name:
+            return
+        get_monitor_store().rename_scene(sid, name.strip())
+        btn.setText(name.strip())
 
     def _style_scene_btn(self, b: QPushButton, active: bool):
         c = COLORS
@@ -631,6 +678,7 @@ class ZoneEditor(QWidget):
         self.zone_type_cb.addItems([
             "🎯  Пиксельное сравнение  (статичный элемент)",
             "🔍  Поиск иконки  (смещающийся баф/иконка)",
+            "📖  Чтение значения  (OCR — число/текст на фиксированной позиции)",
         ])
         self.zone_type_cb.setStyleSheet(self._combo_s())
         self._no_wheel(self.zone_type_cb)
@@ -968,6 +1016,94 @@ class ZoneEditor(QWidget):
         self.tpl_w.hide()
         # ── end template fields ───────────────────────────────────────────────
 
+        # ── OCR-read fields (shown only for zone_type = "ocr_read") ──────────
+        self.ocr_w = QWidget(); ocr_l = QVBoxLayout(self.ocr_w)
+        ocr_l.setContentsMargins(0, 4, 0, 0); ocr_l.setSpacing(6)
+
+        # Hint label
+        ocr_hint = QLabel(
+            "ℹ  OCR читает текст/число из выделенной области каждый тик.\n"
+            "   Прочитанное значение записывается напрямую в переменную State.\n"
+            "   Рекомендуется приоритет «Фоновый» (OCR ~50мс/тик).")
+        ocr_hint.setWordWrap(True)
+        ocr_hint.setStyleSheet(
+            f"color:{COLORS['amber']};font-size:{FONTS['size_xs']};"
+            f"background:transparent;padding:4px 0;")
+        ocr_l.addWidget(ocr_hint)
+
+        # OCR mode: int / str
+        self._lbl(ocr_l, "Тип прочитанного значения")
+        self.ocr_mode_cb = QComboBox()
+        self.ocr_mode_cb.addItems(["Число (int)", "Текст (str)"])
+        self.ocr_mode_cb.setStyleSheet(self._combo_s())
+        self._no_wheel(self.ocr_mode_cb)
+        ocr_l.addWidget(self.ocr_mode_cb)
+
+        # Poll rate (ms between reads)
+        self._lbl(ocr_l, "Частота обновления переменной State (мс)")
+        poll_row = QWidget(); poll_lay = QHBoxLayout(poll_row)
+        poll_lay.setContentsMargins(0, 0, 0, 0); poll_lay.setSpacing(8)
+        self.ocr_poll_sp = QSpinBox()
+        self.ocr_poll_sp.setRange(100, 10000); self.ocr_poll_sp.setSingleStep(100)
+        self.ocr_poll_sp.setValue(500); self.ocr_poll_sp.setSuffix(" мс")
+        self.ocr_poll_sp.setFixedHeight(28)
+        self.ocr_poll_sp.setStyleSheet(
+            f"QSpinBox{{background:{COLORS['bg_elevated']};color:{COLORS['text_primary']};"
+            f"border:1px solid {COLORS['border_bright']};border-radius:4px;"
+            f"padding:2px 6px;font-size:{FONTS['size_xs']};}}")
+        poll_hint = QLabel("(как часто записывать в State; 100мс=часто, 2000мс=редко)")
+        poll_hint.setStyleSheet(
+            f"color:{COLORS['text_muted']};font-size:{FONTS['size_xs']};background:transparent;")
+        poll_lay.addWidget(self.ocr_poll_sp)
+        poll_lay.addWidget(poll_hint)
+        poll_lay.addStretch()
+        ocr_l.addWidget(poll_row)
+
+        # Target state variable
+        self._lbl(ocr_l, "Переменная State (куда записывать)")
+        self.ocr_var_cb = QComboBox()
+        self.ocr_var_cb.setStyleSheet(self._combo_s())
+        self._no_wheel(self.ocr_var_cb)
+        ocr_l.addWidget(self.ocr_var_cb)
+
+        # Test button + preview
+        ocr_test_row = QWidget(); ocr_test_lay = QHBoxLayout(ocr_test_row)
+        ocr_test_lay.setContentsMargins(0, 0, 0, 0); ocr_test_lay.setSpacing(8)
+        btn_ocr_test = QPushButton("🔍 Тест OCR")
+        btn_ocr_test.setFixedHeight(28)
+        btn_ocr_test.setStyleSheet(
+            f"QPushButton{{background:{COLORS['bg_elevated']};color:{COLORS['accent_bright']};"
+            f"border:1px solid {COLORS['accent']};border-radius:4px;"
+            f"font-size:{FONTS['size_xs']};padding:0 10px;}}"
+            f"QPushButton:hover{{background:{COLORS['accent']};color:white;}}")
+        btn_ocr_test.clicked.connect(self._ocr_test)
+        self.ocr_preview_lbl = QLabel("—")
+        self.ocr_preview_lbl.setStyleSheet(
+            f"color:{COLORS['success']};font-size:{FONTS['size_sm']};"
+            f"font-family:{FONTS['mono']};font-weight:700;background:transparent;")
+        ocr_test_lay.addWidget(btn_ocr_test)
+        ocr_test_lay.addWidget(self.ocr_preview_lbl, 1)
+        ocr_l.addWidget(ocr_test_row)
+
+        # Live readout (during monitoring)
+        ocr_live_row = QWidget(); ocr_live_lay = QHBoxLayout(ocr_live_row)
+        ocr_live_lay.setContentsMargins(0, 0, 0, 0); ocr_live_lay.setSpacing(6)
+        ocr_live_lbl = QLabel("Во время мониторинга:")
+        ocr_live_lbl.setStyleSheet(
+            f"color:{COLORS['text_muted']};font-size:{FONTS['size_xs']};background:transparent;")
+        self.ocr_live_val = QLabel("—")
+        self.ocr_live_val.setStyleSheet(
+            f"color:{COLORS['accent_bright']};font-size:{FONTS['size_xs']};"
+            f"font-family:{FONTS['mono']};background:transparent;")
+        ocr_live_lay.addWidget(ocr_live_lbl)
+        ocr_live_lay.addWidget(self.ocr_live_val)
+        ocr_live_lay.addStretch()
+        ocr_l.addWidget(ocr_live_row)
+
+        lay.addWidget(self.ocr_w)
+        self.ocr_w.hide()
+        # ── end ocr_read fields ───────────────────────────────────────────────
+
         lay.addWidget(self._sep())
 
         # Priority
@@ -1023,7 +1159,7 @@ class ZoneEditor(QWidget):
         # Action
         self._lbl(lay, "Действие при срабатывании")
         self.act_cb = QComboBox()
-        self.act_cb.addItems(["Нажать клавишу/кнопку","Выполнить макрос"])
+        self.act_cb.addItems(["Нажать клавишу/кнопку","Выполнить макрос","Установить переменную"])
         self.act_cb.setStyleSheet(self._combo_s())
         self._no_wheel(self.act_cb)
         self.act_cb.currentIndexChanged.connect(self._on_act_type)
@@ -1052,6 +1188,26 @@ class ZoneEditor(QWidget):
         ml.addWidget(self.mac_cb,1)
         lay.addWidget(self.mac_w)
         self.mac_w.hide()
+
+        # State variable row
+        self.state_w = QWidget(); stl = QHBoxLayout(self.state_w)
+        stl.setContentsMargins(0,0,0,0); stl.setSpacing(6)
+        self._lbl_h(stl,"Переменная:")
+        self.state_var_cb = QComboBox(); self.state_var_cb.setStyleSheet(self._combo_s())
+        self._no_wheel(self.state_var_cb)
+        self._refresh_state_vars()
+        stl.addWidget(self.state_var_cb,1)
+        self._lbl_h(stl,"=")
+        self.state_val_e = QLineEdit()
+        self.state_val_e.setPlaceholderText("значение")
+        self.state_val_e.setFixedWidth(90)
+        self.state_val_e.setStyleSheet(
+            f"background:{c['bg_panel']};border:1px solid {c['border']};"
+            f"border-radius:5px;padding:4px 8px;"
+            f"color:{c['text_primary']};font-size:{FONTS['size_sm']};")
+        stl.addWidget(self.state_val_e)
+        lay.addWidget(self.state_w)
+        self.state_w.hide()
 
         # Cooldown
         cool_row = QHBoxLayout(); cool_row.setSpacing(6)
@@ -1128,18 +1284,30 @@ class ZoneEditor(QWidget):
             f"color:{COLORS['success']};font-size:{FONTS['size_xs']};")
 
     def _on_zone_type(self, idx: int):
-        """Toggle between pixel and template UI sections."""
+        """Toggle between pixel, template, and ocr_read UI sections."""
+        is_pixel    = idx == 0
         is_template = idx == 1
+        is_ocr      = idx == 2
         # pixel fields
-        self.thumb.setVisible(not is_template)
-        self.ref_lbl.setVisible(not is_template)
-        self.pix_cond_w.setVisible(not is_template)
+        self.thumb.setVisible(is_pixel)
+        self.ref_lbl.setVisible(is_pixel)
+        self.pix_cond_w.setVisible(is_pixel)
         # template fields
         self.tpl_w.setVisible(is_template)
         if is_template and self.grid_cb.isChecked():
             self.grid_w.show()
-        elif not is_template:
+        else:
             self.grid_w.hide()
+        # ocr_read fields
+        self.ocr_w.setVisible(is_ocr)
+        if is_ocr:
+            self._refresh_ocr_vars()
+        # shared action/condition sections: hide for ocr_read (it writes directly)
+        self.repeat_cb.setVisible(not is_ocr)
+        self.act_cb.setVisible(not is_ocr)
+        self.key_w.setVisible(is_pixel and self.act_cb.currentIndex() == 0)
+        self.mac_w.setVisible(not is_ocr and self.act_cb.currentIndex() == 1)
+        self.state_w.setVisible(not is_ocr and self.act_cb.currentIndex() == 2)
 
     def _on_match_mode(self, idx: int):
         self.tpl_val_w.setVisible(idx > 0)
@@ -1347,8 +1515,41 @@ class ZoneEditor(QWidget):
         self.ref_lbl.setStyleSheet(
             f"color:{COLORS['success']};font-size:{FONTS['size_xs']};")
 
+    def _ocr_test(self):
+        """Capture current rect, run OCR, show result in preview label."""
+        if not self._rect:
+            self.ocr_preview_lbl.setText("⚠ Сначала выделите область")
+            self.ocr_preview_lbl.setStyleSheet(
+                f"color:{COLORS['amber']};font-size:{FONTS['size_sm']};"
+                f"font-family:{FONTS['mono']};font-weight:700;background:transparent;")
+            return
+        self.ocr_preview_lbl.setText("⟳ читаю…")
+        from core.ocr_engine import get_ocr_engine
+        img = capture_region(self._rect)
+        if img is None:
+            self.ocr_preview_lbl.setText("✗ ошибка захвата")
+            return
+        raw = get_ocr_engine().read_text(img)
+        mode = "int" if self.ocr_mode_cb.currentIndex() == 0 else "str"
+        if mode == "int":
+            import re
+            m = re.search(r"\d+", raw or "")
+            result = m.group() if m else f"? ({raw!r})"
+        else:
+            result = raw.strip() if raw else "—"
+        ok = bool(result and result != f"? ({raw!r})" and result != "—")
+        color = COLORS["success"] if ok else COLORS["danger"]
+        self.ocr_preview_lbl.setText(f"→ {result}")
+        self.ocr_preview_lbl.setStyleSheet(
+            f"color:{color};font-size:{FONTS['size_sm']};"
+            f"font-family:{FONTS['mono']};font-weight:700;background:transparent;")
+
     def _on_act_type(self, idx):
-        self.key_w.setVisible(idx==0); self.mac_w.setVisible(idx==1)
+        self.key_w.setVisible(idx==0)
+        self.mac_w.setVisible(idx==1)
+        self.state_w.setVisible(idx==2)
+        if idx == 2:
+            self._refresh_state_vars()
 
     def _open_hk(self):
         from ui.hotkey_capture import HotkeyCaptureDialog
@@ -1361,6 +1562,39 @@ class ZoneEditor(QWidget):
         for m in get_store().all():
             self.mac_cb.addItem(m.get("name","?"), m.get("id"))
 
+    def _refresh_state_vars(self):
+        try:
+            from core.state_store import get_state_store
+            cur = self.state_var_cb.currentData()
+            self.state_var_cb.clear()
+            self.state_var_cb.addItem("— не выбрана —", None)
+            for v in get_state_store().all_vars():
+                self.state_var_cb.addItem(
+                    f"{v['name']}  ({v['type']})", v["name"])
+            if cur:
+                idx = self.state_var_cb.findData(cur)
+                if idx >= 0:
+                    self.state_var_cb.setCurrentIndex(idx)
+        except Exception as e:
+            log.debug(f"_refresh_state_vars: {e}")
+
+    def _refresh_ocr_vars(self):
+        """Populate ocr_var_cb from StateStore (for ocr_read zones)."""
+        try:
+            from core.state_store import get_state_store
+            cur = self.ocr_var_cb.currentData()
+            self.ocr_var_cb.clear()
+            self.ocr_var_cb.addItem("— не выбрана —", None)
+            for v in get_state_store().all_vars():
+                self.ocr_var_cb.addItem(
+                    f"{v['name']}  ({v['type']})", v["name"])
+            if cur:
+                idx = self.ocr_var_cb.findData(cur)
+                if idx >= 0:
+                    self.ocr_var_cb.setCurrentIndex(idx)
+        except Exception as e:
+            log.debug(f"_refresh_ocr_vars: {e}")
+
     def _save(self):
         if not self._scene_id:
             QMessageBox.warning(self,"Нет сцены","Выберите сцену."); return
@@ -1369,27 +1603,33 @@ class ZoneEditor(QWidget):
             QMessageBox.warning(self,"Ошибка","Введите название зоны."); return
         if not self._rect:
             QMessageBox.warning(self,"Ошибка","Выделите область."); return
-        is_tpl = self.zone_type_cb.currentIndex() == 1
-        if not is_tpl and not self._ref_b64:
+        zone_idx = self.zone_type_cb.currentIndex()
+        is_tpl = zone_idx == 1
+        is_ocr = zone_idx == 2
+        if not is_tpl and not is_ocr and not self._ref_b64:
             QMessageBox.warning(self,"Ошибка","Захватите эталон."); return
+        if is_ocr and not self.ocr_var_cb.currentData():
+            QMessageBox.warning(self,"Ошибка","Выберите переменную State для OCR-зоны."); return
 
-        is_tpl = self.zone_type_cb.currentIndex() == 1
-        atype  = "key" if self.act_cb.currentIndex()==0 else "macro"
+        aidx = self.act_cb.currentIndex()
+        atype = "key" if aidx==0 else ("macro" if aidx==1 else "state")
         mm_map = ["icon_only","icon_value_lt","icon_value_gt","icon_value_eq"]
         data = {
             "name":            name,
-            "zone_type":       "template" if is_tpl else "pixel",
+            "zone_type":       "template" if is_tpl else ("ocr_read" if is_ocr else "pixel"),
             "shape":           "circle" if self.shape_cb.currentIndex()==1 else "rect",
             "rect":            self._rect,
             "cx_rel":          self._cx_rel,
             "cy_rel":          self._cy_rel,
             "r_rel":           self._r_rel,
             # pixel fields
-            "reference":       self._ref_b64,
+            "reference":       "" if is_ocr else self._ref_b64,
             "condition":       "match" if self.cond_cb.currentIndex()==0 else "no_match",
             "threshold":       round(self.thr_sp.value(), 2),
+            # ocr_read fields
+            "ocr_mode":        "int" if self.ocr_mode_cb.currentIndex()==0 else "str",
             # template fields
-            "template":        self._tpl_b64,
+            "template":        "" if is_ocr else self._tpl_b64,
             "search_rect":     self._search_rect,
             "match_mode":      mm_map[self.match_mode_cb.currentIndex()],
             "value_target":    self.value_target_sp.value(),
@@ -1413,10 +1653,14 @@ class ZoneEditor(QWidget):
             "priority":        self.pri_cb.currentData(),
             "parallel":        self.parallel_cb.isChecked(),
             "repeat_on_cooldown": self.repeat_cb.isChecked(),
-            "action_type":     atype,
-            "action_key":      self.key_e.text() if atype=="key" else "",
-            "action_macro_id": self.mac_cb.currentData() if atype=="macro" else None,
-            "cooldown_ms":     self.cool_sp.value(),
+            "action_type":      "state" if is_ocr else atype,
+            "action_key":       self.key_e.text() if (not is_ocr and atype=="key") else "",
+            "action_macro_id":  self.mac_cb.currentData() if (not is_ocr and atype=="macro") else None,
+            "state_var_name":   self.ocr_var_cb.currentData() if is_ocr else (
+                                    self.state_var_cb.currentData() if atype=="state" else ""),
+            "state_var_value":  None if is_ocr else (
+                                    self.state_val_e.text() if atype=="state" else None),
+            "cooldown_ms":     self.ocr_poll_sp.value() if is_ocr else self.cool_sp.value(),
             "humanize_ms":     self.hum_sp.value(),
             "active":          False,
         }
@@ -1460,8 +1704,9 @@ class ZoneEditor(QWidget):
 
         # Zone type
         ztype = zone.get("zone_type","pixel")
-        self.zone_type_cb.setCurrentIndex(1 if ztype=="template" else 0)
-        self._on_zone_type(1 if ztype=="template" else 0)
+        zt_idx = 1 if ztype=="template" else (2 if ztype=="ocr_read" else 0)
+        self.zone_type_cb.setCurrentIndex(zt_idx)
+        self._on_zone_type(zt_idx)
 
         # Shape
         self.shape_cb.setCurrentIndex(
@@ -1522,15 +1767,32 @@ class ZoneEditor(QWidget):
             self.grid_off_x.setValue(grid.get("offset_x", 0))
             self.grid_off_y.setValue(grid.get("offset_y", 0))
 
+        # OCR-read fields
+        if ztype == "ocr_read":
+            self.ocr_mode_cb.setCurrentIndex(
+                0 if zone.get("ocr_mode","int") == "int" else 1)
+            self.ocr_poll_sp.setValue(zone.get("cooldown_ms", 500))
+            self._refresh_ocr_vars()
+            ocr_var_idx = self.ocr_var_cb.findData(zone.get("state_var_name",""))
+            if ocr_var_idx >= 0:
+                self.ocr_var_cb.setCurrentIndex(ocr_var_idx)
+
         # Shared
         pri = zone.get("priority",2)
         self.pri_cb.setCurrentIndex(pri-1)
         self.parallel_cb.setChecked(zone.get("parallel",False))
         self.repeat_cb.setChecked(zone.get("repeat_on_cooldown",False))
         atype = zone.get("action_type","key")
-        self.act_cb.setCurrentIndex(0 if atype=="key" else 1)
-        self.key_e.setText(zone.get("action_key",""))
-        self._refresh_macros()
+        if ztype != "ocr_read":
+            self.act_cb.setCurrentIndex(0 if atype=="key" else (1 if atype=="macro" else 2))
+            self.key_e.setText(zone.get("action_key",""))
+            self._refresh_macros()
+            if atype == "state":
+                self._refresh_state_vars()
+                idx = self.state_var_cb.findData(zone.get("state_var_name",""))
+                if idx >= 0:
+                    self.state_var_cb.setCurrentIndex(idx)
+                self.state_val_e.setText(str(zone.get("state_var_value","")))
         self.cool_sp.setValue(zone.get("cooldown_ms",1000))
         self.hum_sp.setValue(zone.get("humanize_ms",0))
 
@@ -1548,6 +1810,12 @@ class ZoneEditor(QWidget):
         self.ref_lbl.setText("Эталон не захвачен")
         self.ref_lbl.setStyleSheet(
             f"color:{COLORS['text_muted']};font-size:{FONTS['size_xs']};")
+        # ocr_read fields
+        self.ocr_mode_cb.setCurrentIndex(0)
+        self.ocr_poll_sp.setValue(500)
+        self.ocr_var_cb.setCurrentIndex(0)
+        self.ocr_live_val.setText("—")
+        self.ocr_preview_lbl.setText("—")
         # template fields
         self.zone_type_cb.setCurrentIndex(0); self._on_zone_type(0)
         self.shape_cb.setCurrentIndex(0)
@@ -2563,11 +2831,18 @@ class MonitorPage(QWidget):
     def _connect_signals(self):
         monitor_signals.zone_state.connect(self._on_zone_state)
         monitor_signals.zone_triggered.connect(self._on_triggered)
+        monitor_signals.zone_value.connect(self._on_zone_value)
         monitor_signals.scene_changed.connect(self._load_scene)
 
     def _on_zone_state(self, zid: int, state: str):
         row = self._rows.get(zid)
         if row: row.led.set_state(state)
+
+    def _on_zone_value(self, zid: int, display: str):
+        """Live OCR read value → update ZoneRow label."""
+        row = self._rows.get(zid)
+        if row and hasattr(row, "val_lbl"):
+            row.val_lbl.setText(display)
 
     def _on_triggered(self, zid: int, name: str, sim: float):
         log.info(f"UI: zone '{name}' triggered sim={sim:.2f}")

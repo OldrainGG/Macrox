@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 class _MonitorSignals(QObject):
     zone_triggered  = pyqtSignal(int, str, float)   # zone_id, name, similarity
     zone_state      = pyqtSignal(int, str)           # zone_id, "match"|"no_match"|"error"
+    zone_value      = pyqtSignal(int, str)           # zone_id, display_str (ocr_read only)
     engine_started  = pyqtSignal()
     engine_stopped  = pyqtSignal()
     scene_changed   = pyqtSignal(int)                # new scene_id
@@ -85,15 +86,17 @@ def _build_pipeline_action(zone: dict):
     from core.action_pipeline import Action
     atype = zone.get("action_type", "key")
     return Action(
-        priority    = zone.get("priority", 2),
-        action_type = atype,
-        parallel    = zone.get("parallel", False),
-        key         = zone.get("action_key", "") if atype == "key" else "",
-        macro_id    = zone.get("action_macro_id") if atype == "macro" else None,
-        source      = "monitor",
-        name        = zone.get("name", ""),
-        zone_id     = zone.get("id", -1),
-        cooldown_ms = zone.get("_actual_cooldown_ms", zone.get("cooldown_ms", 0)),
+        priority        = zone.get("priority", 2),
+        action_type     = atype,
+        parallel        = zone.get("parallel", False),
+        key             = zone.get("action_key", "") if atype == "key" else "",
+        macro_id        = zone.get("action_macro_id") if atype == "macro" else None,
+        state_var_name  = zone.get("state_var_name", "") if atype == "state" else "",
+        state_var_value = zone.get("state_var_value") if atype == "state" else None,
+        source          = "monitor",
+        name            = zone.get("name", ""),
+        zone_id         = zone.get("id", -1),
+        cooldown_ms     = zone.get("_actual_cooldown_ms", zone.get("cooldown_ms", 0)),
     )
 
 
@@ -101,12 +104,15 @@ def _log_monitor_trigger(zone: dict):
     """Записать событие срабатывания зоны или группы в журнал."""
     try:
         from core.journal import get_journal
-        atype      = zone.get("action_type", "key")
-        action_str = (
-            zone.get("action_key", "")
-            if atype == "key"
-            else f"macro#{zone.get('action_macro_id', '')}"
-        )
+        atype = zone.get("action_type", "key")
+        if atype == "key":
+            action_str = zone.get("action_key", "")
+        elif atype == "macro":
+            action_str = f"macro#{zone.get('action_macro_id', '')}"
+        elif atype == "state":
+            action_str = f"state:{zone.get('state_var_name','')}={zone.get('state_var_value','')}"
+        else:
+            action_str = atype
         get_journal().on_monitor_trigger(
             zone_id            = zone.get("id", -1),
             zone_name          = zone.get("name", ""),
@@ -126,11 +132,15 @@ class ZoneWorker:
     Tracks _last_state for use by ConditionGroups.
     """
     def __init__(self, zone: dict):
-        self.zone        = zone
-        self._prev       = None
-        self._last_fire  = 0.0
-        self._last_state = "no_match"   # читается GroupManager
-        self._evaluator  = None
+        self.zone             = zone
+        self._prev            = None
+        self._last_fire       = 0.0
+        self._last_state      = "no_match"   # читается GroupManager
+        self._evaluator       = None
+        # ocr_read tracking
+        self._last_read_value = None   # последнее успешно прочитанное значение
+        self._fail_streak     = 0      # подряд идущих OCR-ошибок
+        self._var_warned      = False  # залогировали warning о несуществующей переменной
         self._load_evaluator()
 
     def _load_evaluator(self):
@@ -256,17 +266,54 @@ class MonitorThread(threading.Thread):
                 worker = self._workers.get(zid)
                 if not worker:
                     continue
+                ztype = zone.get("zone_type", "pixel")
                 try:
-                    state, sim = worker.tick()
-                    monitor_signals.zone_state.emit(zid, state)
-                    if worker.should_fire(state):
-                        log.info(
-                            f"Zone '{zone['name']}' "
-                            f"p={zone.get('priority', 2)} sim={sim:.3f}"
-                        )
-                        monitor_signals.zone_triggered.emit(zid, zone["name"], sim)
-                        _log_monitor_trigger(zone)
-                        pipeline.submit(_build_pipeline_action(zone))
+                    if ztype == "ocr_read":
+                        # Polling path: no trigger, no pipeline — direct StateStore write
+                        value, display = worker._evaluator.eval_ocr_read(capture_region)
+                        if value is not None:
+                            worker._fail_streak = 0
+                            worker._last_state  = "match"   # для ConditionGroups: читает = match
+                            var_name = zone.get("state_var_name", "")
+                            if var_name:
+                                from core.state_store import get_state_store
+                                ss = get_state_store()
+                                if ss.has(var_name):
+                                    # Cooldown: не спамить StateStore быстрее cooldown_ms
+                                    cd = max(50, zone.get("cooldown_ms", 500)) / 1000.0
+                                    if time.time() - worker._last_fire >= cd:
+                                        ss.set(var_name, value)
+                                        worker._last_fire = time.time()
+                                elif not worker._var_warned:
+                                    log.warning(
+                                        f"ocr_read zone '{zone['name']}': "
+                                        f"state var '{var_name}' not found in StateStore"
+                                    )
+                                    worker._var_warned = True
+                        else:
+                            worker._fail_streak += 1
+                            worker._last_state = "no_match"
+                            fail_limit = zone.get("ocr_fail_limit", 5)
+                            if worker._fail_streak == fail_limit:
+                                log.error(
+                                    f"Zone '{zone['name']}': OCR failed "
+                                    f"{worker._fail_streak}x in a row"
+                                )
+                            display = "—"
+                        monitor_signals.zone_state.emit(zid, worker._last_state)
+                        monitor_signals.zone_value.emit(zid, display)
+                    else:
+                        # Existing pixel/template trigger path
+                        state, sim = worker.tick()
+                        monitor_signals.zone_state.emit(zid, state)
+                        if worker.should_fire(state):
+                            log.info(
+                                f"Zone '{zone['name']}' "
+                                f"p={zone.get('priority', 2)} sim={sim:.3f}"
+                            )
+                            monitor_signals.zone_triggered.emit(zid, zone["name"], sim)
+                            _log_monitor_trigger(zone)
+                            pipeline.submit(_build_pipeline_action(zone))
                 except Exception as e:
                     log.error(f"Zone {zid}: {e}")
                     monitor_signals.zone_state.emit(zid, "error")

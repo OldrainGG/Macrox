@@ -1,0 +1,11 @@
+{
+  "variables": [
+    {
+      "name": "hp",
+      "type": "int",
+      "default": 0,
+      "choices": [],
+      "description": "hp - числовое значение"
+    }
+  ]
+}

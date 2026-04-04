@@ -2,6 +2,7 @@
 __pycache__/
 core/__pycache__/
 ui/__pycache__/
+.claude/
 
 # Logs
 logs/
@@ -16,3 +17,4 @@ run_debug.bat
 
 # Other
 if not starterted.txt
+CLAUDE.md

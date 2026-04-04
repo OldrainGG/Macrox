@@ -236,10 +236,38 @@ class ZoneEvaluator:
         z = self.zone
         ztype = z.get("zone_type", "pixel")
 
+        if ztype == "ocr_read":
+            raise RuntimeError("Use eval_ocr_read() directly for ocr_read zones")
         if ztype == "template":
             return self._eval_template(capture_fn)
         else:
             return self._eval_pixel(capture_fn)
+
+    def eval_ocr_read(self, capture_fn) -> tuple[object, str]:
+        """
+        For ocr_read zones: capture fixed region, run OCR, return (value_or_None, display_str).
+        Does NOT go through trigger/pipeline — called directly from engine polling loop.
+        """
+        import re
+        rect = self.zone.get("rect", [0, 0, 64, 64])
+        img  = capture_fn(rect)
+        if img is None:
+            return None, "capture_fail"
+        try:
+            from core.ocr_engine import get_ocr_engine
+            raw = get_ocr_engine().read_text(img)
+        except Exception as e:
+            log.debug(f"eval_ocr_read OCR error: {e}")
+            return None, "ocr_err"
+        ocr_mode = self.zone.get("ocr_mode", "int")
+        if not raw:
+            return None, "—"
+        if ocr_mode == "int":
+            m = re.search(r"\d+", raw)
+            return (int(m.group()), m.group()) if m else (None, f"?({raw[:8]})")
+        else:
+            cleaned = raw.strip()
+            return (cleaned or None, cleaned or "—")
 
     def _eval_pixel(self, capture_fn) -> tuple[str, float]:
         if not self._ref: return "error", 0.0

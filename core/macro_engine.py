@@ -68,52 +68,44 @@ class _SignalsProxy:
 engine_signals = _SignalsProxy()
 
 
-def _journal_call(fn, *args):
-    """
-    Schedule a Journal call on the main thread via QTimer.singleShot(0).
-    This is the most reliable way to cross thread boundaries in PyQt6 —
-    no QObject affinity issues, no connection type guessing.
-    """
-    from PyQt6.QtCore import QTimer
-    QTimer.singleShot(0, lambda: _safe_journal(fn, *args))
-
-def _safe_journal(fn, *args):
-    try:
-        fn(*args)
-    except Exception as e:
-        log.debug(f"_safe_journal: {e}")
-
-
-def _journal_started(macro_id: int, macro_name: str):
+def _journal_macro_started(macro_id: int, macro_name: str):
+    """Вызывается напрямую из MacroRunner — как on_monitor_trigger в monitor_engine."""
     try:
         from core.journal import get_journal
         get_journal().on_macro_started(macro_id, macro_name)
     except Exception as e:
-        log.debug(f"_journal_started: {e}")
+        log.error(f"_journal_macro_started: {e}", exc_info=True)
 
-def _journal_stopped(macro_id: int, macro_name: str):
+def _journal_macro_stopped(macro_id: int, macro_name: str):
     try:
         from core.journal import get_journal
         get_journal().on_macro_stopped(macro_id, macro_name)
     except Exception as e:
-        log.debug(f"_journal_stopped: {e}")
+        log.error(f"_journal_macro_stopped: {e}", exc_info=True)
 
-def _journal_step(macro_id: int, macro_name: str, key: str, delay_ms: int):
+def _journal_step_executed(macro_id: int, macro_name: str, key: str, delay_ms: int):
     try:
         from core.journal import get_journal
         get_journal().on_step_executed(macro_id, macro_name, key, delay_ms)
     except Exception as e:
-        log.debug(f"_journal_step: {e}")
+        log.error(f"_journal_step_executed: {e}", exc_info=True)
 
+def _journal_macro_skipped(macro_id: int, macro_name: str):
+    try:
+        from core.journal import get_journal
+        get_journal().on_macro_skipped(macro_id, macro_name)
+    except Exception as e:
+        log.error(f"_journal_macro_skipped: {e}", exc_info=True)
+
+def _journal_step_skipped(macro_id: int, macro_name: str, key: str, action: str):
+    try:
+        from core.journal import get_journal
+        get_journal().on_step_skipped(macro_id, macro_name, key, action)
+    except Exception as e:
+        log.error(f"_journal_step_skipped: {e}", exc_info=True)
 
 def _connect_journal():
-    """
-    Wire engine signals into the Journal.
-    NOTE: Journal is now called directly via QTimer.singleShot from MacroRunner
-    (see _journal_call). This function connects active_count_changed for UI only.
-    Kept for backward compatibility and future use.
-    """
-    pass  # Direct calls via _journal_call handle all journal writes
+    pass  # journal is written directly from MacroRunner (see _journal_macro_* above)
 
 
 def _get_id_by_name(name: str) -> int:
@@ -128,7 +120,7 @@ def _get_id_by_name(name: str) -> int:
     return -1
 
 
-# ── Zone state checker (for conditions) ──────────────────────────────────────
+# ── Condition checkers ───────────────────────────────────────────────────────
 
 def _check_zone_condition(condition: dict | None) -> bool:
     """
@@ -161,6 +153,34 @@ def _check_zone_condition(condition: dict | None) -> bool:
     except Exception as e:
         log.warning(f"_check_zone_condition: {e} → pass through")
         return True
+
+
+def _check_state_condition(condition: dict) -> bool:
+    """
+    Evaluate a condition dict against StateStore.
+    condition = {"state_var": "hp_pct", "op": "<=", "value": 30}
+    """
+    try:
+        from core.state_store import get_state_store
+        result = get_state_store().evaluate(condition)
+        log.debug(f"_check_state_condition: {condition} → {result}")
+        return result
+    except Exception as e:
+        log.warning(f"_check_state_condition: {e} → pass through")
+        return True
+
+
+def _check_condition(condition: dict | None) -> bool:
+    """
+    Unified condition checker: routes to zone or state checker based on condition type.
+    condition = {"zone_id": N, "state": "match"}       → zone check
+    condition = {"state_var": "hp_pct", "op": "<=", "value": 30} → state check
+    """
+    if not condition:
+        return True
+    if "state_var" in condition:
+        return _check_state_condition(condition)
+    return _check_zone_condition(condition)
 
 
 # ── Step executor ─────────────────────────────────────────────────────────────
@@ -206,10 +226,12 @@ def _execute_steps(steps: list[dict], stop_event: threading.Event,
         # ── Step-level condition (Variant B) ──────────────────────────────
         step_cond = step.get("condition")
         if step_cond:
-            if not _check_zone_condition(step_cond):
+            if not _check_condition(step_cond):
                 cond_action = step.get("condition_action", "skip")
                 key_str     = step.get("key", "")
                 log.info(f"Step condition not met: key='{key_str}' action={cond_action}")
+                _mid = macro_id if macro_id >= 0 else _get_id_by_name(macro_name)
+                _journal_step_skipped(_mid, macro_name, key_str, cond_action)
                 try:
                     engine_signals.step_skipped.emit(macro_name, key_str)
                 except Exception:
@@ -230,11 +252,9 @@ def _execute_steps(steps: list[dict], stop_event: threading.Event,
 
         key_str = step.get("key", "")
         _press_key(kb, ms, key_str, MOD_KEYS, MOUSE_MAP_INV)
-        # Direct journal call via main-thread timer — reliable across threads
-        _mid  = macro_id if macro_id >= 0 else _get_id_by_name(macro_name)
-        _dms  = step.get("delay_ms", 0)
-        _journal_call(_journal_step, _mid, macro_name, key_str, _dms)
-        # Keep signal for any external subscribers
+        _dms = step.get("delay_ms", 0)
+        _mid = macro_id if macro_id >= 0 else _get_id_by_name(macro_name)
+        _journal_step_executed(_mid, macro_name, key_str, _dms)
         try:
             engine_signals.step_executed.emit(macro_name, key_str, _dms)
         except Exception:
@@ -438,15 +458,20 @@ class MacroRunner(threading.Thread):
         mid   = self.macro.get("id", -1)
         log.info(f"MacroRunner start: '{name}'  mode={mode}  steps={len(steps)}")
 
-        # Journal: macro started — via QTimer to main thread
-        _journal_call(_journal_started, mid, name)
+        _journal_macro_started(mid, name)
+        try:
+            engine_signals.macro_started.emit(name)
+            engine_signals.active_count_changed.emit(1)
+        except Exception:
+            pass
 
         skipped_by_condition = False
         try:
             macro_cond = self.macro.get("condition")
-            if macro_cond and not _check_zone_condition(macro_cond):
+            if macro_cond and not _check_condition(macro_cond):
                 log.info(f"MacroRunner '{name}': macro condition not met → skip")
                 skipped_by_condition = True
+                _journal_macro_skipped(mid, name)
             else:
                 if mode == 0:   self._run_once(steps, name, mid)
                 elif mode == 1: self._run_hold(steps, name, mid)
@@ -457,11 +482,8 @@ class MacroRunner(threading.Thread):
         self._running = False
         log.info(f"MacroRunner done: '{name}'")
 
-        # Journal: macro stopped — direct call for natural completion
         if not skipped_by_condition:
-            _journal_call(_journal_stopped, mid, name)
-
-        # UI signal: active count update
+            _journal_macro_stopped(mid, name)
         if not self._stop.is_set() and not skipped_by_condition:
             try:
                 engine_signals.macro_stopped.emit(name)

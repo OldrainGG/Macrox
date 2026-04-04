@@ -9,7 +9,7 @@ Fixes:
 """
 import logging
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QSpinBox, QLineEdit, QCheckBox,
     QMessageBox, QComboBox, QGroupBox
 )
@@ -123,19 +123,35 @@ class MacroCard(QFrame):
         mode   = MODE_LABELS[self.data.get("mode", 0)]
         delay  = self.data.get("delay_ms", 0)
         rand   = self.data.get("random_ms", 0)
+        cond   = self.data.get("condition") or {}
+        # Macro-level launch condition badge
+        cond_badge = ""
+        if cond.get("state_var"):
+            op  = cond.get("op", "==")
+            val = cond.get("value", "")
+            cond_badge = f"  •  🔒 {cond['state_var']} {op} {val}"
+        elif cond.get("zone_id") is not None:
+            cond_badge = f"  •  🔒 zone#{cond['zone_id']} {cond.get('state','match')}"
+        # Step-level conditions badge
+        step_cond_count = sum(1 for s in steps if s.get("condition"))
+        step_badge = f"  •  🔒×{step_cond_count} шагов" if step_cond_count else ""
         if steps:
             ks = " → ".join(s["key"] for s in steps[:7])
             if len(steps) > 7: ks += f" +{len(steps)-7}"
-            return f"{ks}   •   {mode}   •   {len(steps)} шагов"
+            return f"{ks}   •   {mode}   •   {len(steps)} шагов{cond_badge}{step_badge}"
         return (f"Задержка: {delay}мс"
                 + (f" ±{rand}мс" if rand else "")
-                + f"   •   {mode}")
+                + f"   •   {mode}{cond_badge}{step_badge}")
 
     def _update_cond_badge(self):
-        cond = self.data.get("condition")
-        if cond and cond.get("zone_id") is not None:
-            state = cond.get("state", "match")
-            self.cond_lbl.setText(f"🔒 zone#{cond['zone_id']} {state}")
+        cond = self.data.get("condition") or {}
+        if cond.get("state_var"):
+            op  = cond.get("op", "==")
+            val = cond.get("value", "")
+            self.cond_lbl.setText(f"🔒 {cond['state_var']} {op} {val}")
+            self.cond_lbl.show()
+        elif cond.get("zone_id") is not None:
+            self.cond_lbl.setText(f"🔒 zone#{cond['zone_id']} {cond.get('state','match')}")
             self.cond_lbl.show()
         else:
             self.cond_lbl.hide()
@@ -177,14 +193,16 @@ class MacroCard(QFrame):
 class MacroConditionWidget(QWidget):
     """
     Compact widget for setting a macro-level condition.
-    Shows zone selector + expected state.
-    Embedded in MacroEditorPanel.
+    Supports two modes:
+      - Zone:  {"zone_id": N, "state": "match"|"no_match"}
+      - State: {"state_var": "hp_pct", "op": "<=", "value": 30}
     """
     def __init__(self, parent=None):
         super().__init__(parent)
         self._zones: list[dict] = []
         self._build()
         self._load_zones()
+        self._load_state_vars()
 
     def _build(self):
         c = COLORS
@@ -192,7 +210,7 @@ class MacroConditionWidget(QWidget):
         lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0); lay.setSpacing(6)
 
         # Enable checkbox
-        self.enabled_cb = QCheckBox("Условие запуска макроса (проверка зоны)")
+        self.enabled_cb = QCheckBox("Условие запуска макроса")
         self.enabled_cb.setStyleSheet(
             f"QCheckBox{{color:{c['text_secondary']};font-size:{FONTS['size_sm']};"
             f"spacing:6px;background:transparent;}}"
@@ -203,26 +221,47 @@ class MacroConditionWidget(QWidget):
         self.enabled_cb.stateChanged.connect(self._on_toggle)
         lay.addWidget(self.enabled_cb)
 
-        # Zone + state row (hidden when disabled)
-        self._detail_w = QWidget(); self._detail_w.setStyleSheet("background:transparent;")
-        dl = QHBoxLayout(self._detail_w); dl.setContentsMargins(20,0,0,0); dl.setSpacing(8)
+        wrap = QWidget(); wrap.setStyleSheet("background:transparent;")
+        wl   = QVBoxLayout(wrap); wl.setContentsMargins(20,0,0,0); wl.setSpacing(6)
+
+        # Mode switcher: Zone | State variable
+        mode_row = QWidget(); mode_row.setStyleSheet("background:transparent;")
+        ml = QHBoxLayout(mode_row); ml.setContentsMargins(0,0,0,0); ml.setSpacing(6)
+        mode_lbl = QLabel("Тип условия:")
+        mode_lbl.setStyleSheet(
+            f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+        ml.addWidget(mode_lbl)
+        self._mode_cb = QComboBox()
+        self._mode_cb.addItem("Зона мониторинга", "zone")
+        self._mode_cb.addItem("Переменная состояния", "state")
+        self._mode_cb.setFixedHeight(26)
+        self._mode_cb.setStyleSheet(self._cb_style())
+        self._mode_cb.installEventFilter(_no_scroll)
+        self._mode_cb.currentIndexChanged.connect(self._on_mode_change)
+        ml.addWidget(self._mode_cb)
+        ml.addStretch()
+        wl.addWidget(mode_row)
+
+        # ── Zone panel ────────────────────────────────────────────────────
+        self._zone_panel = QWidget(); self._zone_panel.setStyleSheet("background:transparent;")
+        zl = QHBoxLayout(self._zone_panel); zl.setContentsMargins(0,0,0,0); zl.setSpacing(8)
 
         zone_lbl = QLabel("Зона:")
         zone_lbl.setStyleSheet(
             f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
-        dl.addWidget(zone_lbl)
+        zl.addWidget(zone_lbl)
 
         self._zone_cb = QComboBox()
         self._zone_cb.setFixedHeight(26)
         self._zone_cb.setMinimumWidth(160)
         self._zone_cb.setStyleSheet(self._cb_style())
         self._zone_cb.installEventFilter(_no_scroll)
-        dl.addWidget(self._zone_cb)
+        zl.addWidget(self._zone_cb)
 
         state_lbl = QLabel("Состояние:")
         state_lbl.setStyleSheet(
             f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
-        dl.addWidget(state_lbl)
+        zl.addWidget(state_lbl)
 
         self._state_cb = QComboBox()
         self._state_cb.addItem("совпадает (match)",    "match")
@@ -230,31 +269,106 @@ class MacroConditionWidget(QWidget):
         self._state_cb.setFixedHeight(26)
         self._state_cb.setStyleSheet(self._cb_style())
         self._state_cb.installEventFilter(_no_scroll)
-        dl.addWidget(self._state_cb)
-        dl.addStretch()
+        zl.addWidget(self._state_cb)
+        zl.addStretch()
+        wl.addWidget(self._zone_panel)
 
-        # Helper text
-        self._hint = QLabel("Макрос запустится только если зона в нужном состоянии")
+        # ── State variable panel ──────────────────────────────────────────
+        self._state_panel = QWidget(); self._state_panel.setStyleSheet("background:transparent;")
+        sg = QGridLayout(self._state_panel)
+        sg.setContentsMargins(0,0,0,0); sg.setHorizontalSpacing(6); sg.setVerticalSpacing(4)
+
+        def _slbl(text):
+            l = QLabel(text)
+            l.setStyleSheet(
+                f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-weight:600;")
+            return l
+
+        sg.addWidget(_slbl("Переменная:"), 0, 0)
+        self._var_cb = QComboBox()
+        self._var_cb.setFixedHeight(26)
+        self._var_cb.setMaximumWidth(160)
+        self._var_cb.setStyleSheet(self._cb_style())
+        self._var_cb.installEventFilter(_no_scroll)
+        self._var_cb.currentIndexChanged.connect(self._on_var_change)
+        sg.addWidget(self._var_cb, 1, 0)
+
+        sg.addWidget(_slbl("Оператор:"), 0, 1)
+        self._op_cb = QComboBox()
+        self._op_cb.setFixedHeight(26)
+        self._op_cb.setFixedWidth(60)
+        self._op_cb.setStyleSheet(self._cb_style())
+        self._op_cb.installEventFilter(_no_scroll)
+        sg.addWidget(self._op_cb, 1, 1)
+
+        sg.addWidget(_slbl("Значение:"), 0, 2)
+        self._val_e = QLineEdit()
+        self._val_e.setFixedHeight(26)
+        self._val_e.setMaximumWidth(100)
+        self._val_e.setStyleSheet(
+            f"QLineEdit{{background:{c['bg_elevated']};color:{c['text_primary']};"
+            f"border:1px solid {c['border_bright']};border-radius:4px;"
+            f"padding:2px 6px;font-size:{FONTS['size_xs']};}}"
+            f"QLineEdit:focus{{border-color:{c['accent']};}}")
+        sg.addWidget(self._val_e, 1, 2)
+
+        # Bool value combobox (shown instead of text field for bool vars)
+        self._val_bool_cb = QComboBox()
+        self._val_bool_cb.addItem("False", "False")
+        self._val_bool_cb.addItem("True", "True")
+        self._val_bool_cb.setFixedHeight(26)
+        self._val_bool_cb.setMaximumWidth(100)
+        self._val_bool_cb.setStyleSheet(self._cb_style())
+        self._val_bool_cb.installEventFilter(_no_scroll)
+        self._val_bool_cb.hide()
+        sg.addWidget(self._val_bool_cb, 1, 2)
+
+        sg.setColumnStretch(3, 1)   # absorb leftover space
+        wl.addWidget(self._state_panel)
+
+        # Hint
+        self._hint = QLabel("")
         self._hint.setStyleSheet(
             f"color:{c['text_muted']};font-size:{FONTS['size_xs']};font-style:italic;")
-        dl_w = QVBoxLayout(); dl_w.setContentsMargins(20,0,0,0); dl_w.setSpacing(2)
-
-        wrap = QWidget(); wrap.setStyleSheet("background:transparent;")
-        wl   = QVBoxLayout(wrap); wl.setContentsMargins(0,0,0,0); wl.setSpacing(4)
-        wl.addWidget(self._detail_w)
         wl.addWidget(self._hint)
-        lay.addWidget(wrap)
 
-        self._detail_w.hide()
-        self._hint.hide()
+        lay.addWidget(wrap)
+        self._wrap = wrap
+        wrap.hide()
+
+        self._on_mode_change()
 
     def _on_toggle(self, state):
         enabled = bool(state)
-        self._detail_w.setVisible(enabled)
-        self._hint.setVisible(enabled)
+        self._wrap.setVisible(enabled)
+
+    def _on_mode_change(self, _=None):
+        mode = self._mode_cb.currentData() if self._mode_cb.count() else "zone"
+        self._zone_panel.setVisible(mode == "zone")
+        self._state_panel.setVisible(mode == "state")
+        if mode == "zone":
+            self._hint.setText("Макрос запустится только если зона в нужном состоянии")
+        else:
+            self._hint.setText("Макрос запустится только если переменная удовлетворяет условию")
+
+    def _on_var_change(self, _=None):
+        """Update operator list and value widget based on selected variable type."""
+        vtype = self._var_cb.currentData()
+        self._op_cb.clear()
+        if vtype == "int":
+            for op in ("==", "!=", "<", "<=", ">", ">="):
+                self._op_cb.addItem(op, op)
+            self._val_e.show(); self._val_bool_cb.hide()
+        elif vtype == "bool":
+            self._op_cb.addItem("==", "==")
+            self._op_cb.addItem("!=", "!=")
+            self._val_e.hide(); self._val_bool_cb.show()
+        else:  # str
+            self._op_cb.addItem("==", "==")
+            self._op_cb.addItem("!=", "!=")
+            self._val_e.show(); self._val_bool_cb.hide()
 
     def _load_zones(self):
-        """Populate zone combobox from active monitor store."""
         try:
             from core.monitor_store import get_monitor_store
             store = get_monitor_store()
@@ -268,6 +382,21 @@ class MacroConditionWidget(QWidget):
         except Exception as e:
             log.debug(f"MacroConditionWidget._load_zones: {e}")
 
+    def _load_state_vars(self):
+        try:
+            from core.state_store import get_state_store
+            self._var_cb.clear()
+            self._var_cb.addItem("— не выбрана —", None)
+            for v in get_state_store().all_vars():
+                self._var_cb.addItem(
+                    f"{v['name']}  ({v['type']})", v["type"])
+                # store name as item data by using a tuple trick via setItemData
+                idx = self._var_cb.count() - 1
+                self._var_cb.setItemData(idx, v["name"], Qt.ItemDataRole.UserRole + 1)
+        except Exception as e:
+            log.debug(f"MacroConditionWidget._load_state_vars: {e}")
+        self._on_var_change()
+
     def refresh_zones(self):
         cur = self._zone_cb.currentData()
         self._load_zones()
@@ -276,31 +405,74 @@ class MacroConditionWidget(QWidget):
             if idx >= 0:
                 self._zone_cb.setCurrentIndex(idx)
 
+    def refresh_state_vars(self):
+        self._load_state_vars()
+
     def get_condition(self) -> dict | None:
-        """Return condition dict or None if disabled/no zone selected."""
         if not self.enabled_cb.isChecked():
             return None
-        zone_id = self._zone_cb.currentData()
-        if zone_id is None:
-            return None
-        return {
-            "zone_id": zone_id,
-            "state":   self._state_cb.currentData(),
-        }
+        mode = self._mode_cb.currentData()
+        if mode == "zone":
+            zone_id = self._zone_cb.currentData()
+            if zone_id is None:
+                return None
+            return {"zone_id": zone_id, "state": self._state_cb.currentData()}
+        else:
+            # state var
+            idx = self._var_cb.currentIndex()
+            if idx <= 0:
+                return None
+            var_name = self._var_cb.itemData(idx, Qt.ItemDataRole.UserRole + 1)
+            vtype    = self._var_cb.currentData()
+            op       = self._op_cb.currentData() or "=="
+            if vtype == "bool":
+                raw = self._val_bool_cb.currentData()
+                value = raw == "True"
+            elif vtype == "int":
+                try:
+                    value = int(self._val_e.text())
+                except ValueError:
+                    value = 0
+            else:
+                value = self._val_e.text()
+            return {"state_var": var_name, "op": op, "value": value}
 
     def set_condition(self, cond: dict | None):
-        """Load condition into widget."""
-        if not cond or cond.get("zone_id") is None:
+        if not cond:
             self.enabled_cb.setChecked(False)
             return
         self.enabled_cb.setChecked(True)
-        self._load_zones()
-        idx = self._zone_cb.findData(cond["zone_id"])
-        if idx >= 0:
-            self._zone_cb.setCurrentIndex(idx)
-        state_idx = self._state_cb.findData(cond.get("state", "match"))
-        if state_idx >= 0:
-            self._state_cb.setCurrentIndex(state_idx)
+        if "zone_id" in cond:
+            self._mode_cb.setCurrentIndex(0)
+            self._on_mode_change()
+            self._load_zones()
+            idx = self._zone_cb.findData(cond["zone_id"])
+            if idx >= 0:
+                self._zone_cb.setCurrentIndex(idx)
+            state_idx = self._state_cb.findData(cond.get("state", "match"))
+            if state_idx >= 0:
+                self._state_cb.setCurrentIndex(state_idx)
+        elif "state_var" in cond:
+            self._mode_cb.setCurrentIndex(1)
+            self._on_mode_change()
+            self._load_state_vars()
+            var_name = cond["state_var"]
+            for i in range(self._var_cb.count()):
+                if self._var_cb.itemData(i, Qt.ItemDataRole.UserRole + 1) == var_name:
+                    self._var_cb.setCurrentIndex(i)
+                    break
+            self._on_var_change()
+            op_idx = self._op_cb.findData(cond.get("op", "=="))
+            if op_idx >= 0:
+                self._op_cb.setCurrentIndex(op_idx)
+            value = cond.get("value")
+            vtype = self._var_cb.currentData()
+            if vtype == "bool":
+                self._val_bool_cb.setCurrentIndex(1 if value else 0)
+            else:
+                self._val_e.setText(str(value) if value is not None else "")
+        else:
+            self.enabled_cb.setChecked(False)
 
     def _cb_style(self) -> str:
         c = COLORS

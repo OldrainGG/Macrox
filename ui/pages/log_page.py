@@ -26,6 +26,7 @@ EVENT_ICONS = {
     "stopped": ("⏹", "#5AA3FF"),
     "step":    ("·", "#4A5068"),
     "error":   ("⚠", "#E74C3C"),
+    "skipped": ("⊘", "#E5A824"),
 }
 
 
@@ -246,7 +247,8 @@ class EntryRow(QWidget):
 
         # Detail
         dcol = {"started":c['success'],"stopped":c['accent_bright'],
-                "step":c['text_secondary'],"error":c['danger']}.get(
+                "step":c['text_secondary'],"error":c['danger'],
+                "skipped":c['amber']}.get(
                     self.entry.event, c['text_muted'])
         dl = QLabel(self.entry.detail)
         dl.setStyleSheet(f"color:{dcol};{fnt}background:transparent;")
